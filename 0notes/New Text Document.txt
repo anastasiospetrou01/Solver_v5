@@ -1,0 +1,37 @@
+more details on:
+flow_assembly.py
+    Constructs the finite-volume momentum coefficients
+    Assembles the complete [u,v,p] matrix
+    Constructs the correction RHS
+    Prepares solver metadata
+
+i did not understand what this does:
+flow_scaling.py
+    Builds physical equation and variable scaling
+
+more info on this:
+dmda_flow.py
+    Preliminary MPI/DMDA infrastructure
+
+further explanation of this, what is full newton:
+It is fully coupled, but not full Newton.
+The matrix contains simultaneous u,v,p coupling, but it does not contain all derivatives of the nonlinear residual.
+this aswell:
+The velocity block has no direct implicit u−v coupling.
+The components interact through pressure, fluxes and outer nonlinear updates.
+
+***It is fully coupled, but not full Newton.
+
+18. Practical interpretation of your current solver
+
+The current method is best described as:
+
+Monolithic, fully coupled [u,v,p]
+Picard/Oseen nonlinear linearization
+Defect-correction update
+Rhie–Chow collocated continuity
+FGMRES + PCD block preconditioning
+
+It is more strongly coupled than SIMPLE-like segregated methods because one linear solve contains all u,v,p variables.
+
+But it is less strongly nonlinear-coupled than full Newton because some nonlinear dependencies are frozen and updated only between outer iterations.

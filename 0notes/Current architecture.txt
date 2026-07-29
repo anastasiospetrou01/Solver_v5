@@ -1,0 +1,34 @@
+python -m solver.steady_lam_v5
+                 │
+                 ▼
+       Bootstrap reads mpi_ranks=4
+                 │
+                 ▼
+ mpiexec -n 4 python -m solver.steady_lam_v5
+                 │
+     ┌───────────┼───────────┬───────────┐
+     ▼           ▼           ▼           ▼
+   Rank 0      Rank 1      Rank 2      Rank 3
+     │           │           │           │
+     ├──── Complete replicated CFD fields ────┤
+     │           │           │           │
+     ├──── Complete replicated momentum pass ─┤
+     │           │           │           │
+ owned rows   owned rows   owned rows   owned rows
+     │           │           │           │
+     └──────── PETSc distributed matrix ──────┘
+                         │
+                         ▼
+               Parallel MUMPS LU
+                         │
+                         ▼
+              Distributed solution
+                         │
+                         ▼
+              Scatter solution to all
+                         │
+     ┌───────────┼───────────┬───────────┐
+     ▼           ▼           ▼           ▼
+ full update   full update  full update  full update
+     │           │           │           │
+     └──── Next nonlinear iteration ────────┘

@@ -1,0 +1,71 @@
+================ CASE INFORMATION ================
+case_name: buoyancy_cavity_1x1
+nx: 200
+ny: 200
+Lx: 1.0
+Ly: 1.0
+dx: 5.00000000e-03
+dy: 5.00000000e-03
+
+region_defs:
+  id=0 | name=glycerin | material=glycerin | phase=fluid
+
+boundaries:
+  heat:
+    west:
+      type: dirichlet
+      T: 30.0
+    east:
+      type: dirichlet
+      T: 20.0
+    south:
+      type: adiabatic
+      T: 0.0
+    north:
+      type: adiabatic
+      T: 0.0
+  flow:
+    west:
+      type: wall
+      u: 0.0
+      v: 0.0
+    east:
+      type: wall
+      u: 0.0
+      v: 0.0
+    south:
+      type: wall
+      u: 0.0
+      v: 0.0
+    north:
+      type: wall
+      u: 0.0
+      v: 0.0
+
+initial_temperature:
+  default: 25.0
+  by_region:
+    glycerin: 25.0
+
+initial_flow:
+  default:
+    u: 0.0
+    v: 0.0
+    p: 0.0
+  by_region:
+    <empty>
+
+sources:
+  energy:
+    default: 0.0
+    by_region:
+      glycerin: 0.0
+  momentum_x:
+    default: 0.0
+    by_region:
+      <empty>
+  momentum_y:
+    default: 0.0
+    by_region:
+      <empty>
+==================================================

@@ -1,0 +1,69 @@
+================ CASE INFORMATION ================
+case_name: wake_test
+nx: 150
+ny: 50
+Lx: 3.0
+Ly: 1.0
+dx: 2.00000000e-02
+dy: 2.00000000e-02
+
+region_defs:
+  id=0 | name=glycerin | material=glycerin | phase=fluid
+  id=1 | name=obstacle | material=glass | phase=solid
+
+boundaries:
+  heat:
+    west:
+      type: open
+      T: 25.0
+    east:
+      type: open
+      T: 25.0
+    south:
+      type: dirichlet
+      T: 25.0
+    north:
+      type: open
+      T: 25.0
+  flow:
+    west:
+      type: inlet
+      u: 0.05
+    east:
+      type: open
+      p: 0.0
+    south:
+      type: symmetry
+      u: 0.0
+      v: 0.0
+    north:
+      type: symmetry
+
+initial_temperature:
+  default: 25.0
+  by_region:
+    glycerin: 25.0
+
+initial_flow:
+  default:
+    u: 0.0
+    v: 0.0
+    p: 0.0
+  by_region:
+    <empty>
+
+sources:
+  energy:
+    default: 0.0
+    by_region:
+      glycerin: 0.0
+      obstacle: 0.0
+  momentum_x:
+    default: 0.0
+    by_region:
+      <empty>
+  momentum_y:
+    default: 0.0
+    by_region:
+      <empty>
+==================================================

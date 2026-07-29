@@ -1,0 +1,67 @@
+================ CASE INFORMATION ================
+case_name: lidcav_20
+nx: 256
+ny: 256
+Lx: 1.0
+Ly: 1.0
+dx: 3.90625000e-03
+dy: 3.90625000e-03
+
+region_defs:
+  id=0 | name=fluid | material=low_Re_fluid | phase=fluid
+
+boundaries:
+  heat:
+    west:
+      type: dirichlet
+      T: 25.0
+    east:
+      type: dirichlet
+      T: 25.0
+    south:
+      type: dirichlet
+      T: 25.0
+    north:
+      type: open
+      T: 25.0
+  flow:
+    west:
+      type: wall
+    east:
+      type: wall
+    south:
+      type: wall
+      u: 0.0
+      v: 0.0
+    north:
+      type: inlet
+      u: 1.0
+      v: 0.0
+
+initial_temperature:
+  default: 25.0
+  by_region:
+    fluid: 25.0
+
+initial_flow:
+  default:
+    u: 0.0
+    v: 0.0
+    p: 0.0
+  by_region:
+    <empty>
+
+sources:
+  energy:
+    default: 0.0
+    by_region:
+      fluid: 0.0
+  momentum_x:
+    default: 0.0
+    by_region:
+      <empty>
+  momentum_y:
+    default: 0.0
+    by_region:
+      <empty>
+==================================================

@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+
+# Conda
+.env
+.venv
+
+# VS Code
+.vscode/
+
+# Solver outputs
+results/
+*.vtk
+*.vtu
+*.csv
+
+# Logs
+*.log
+
+# Linux
+.DS_Store
+Thumbs.db

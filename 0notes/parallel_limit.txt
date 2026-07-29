@@ -1,0 +1,33 @@
+25. Current scaling limitations
+
+The main limitations are now:
+
+Replicated momentum coefficient pass
+
+All ranks loop over all fluid cells.
+
+Replicated nonlinear fields
+
+Every rank stores complete u, v, p and T.
+
+All-gather after every linear solve
+
+Complete corrections are sent to every rank.
+
+Replicated energy assembly
+
+Every rank builds the complete SciPy temperature matrix.
+
+Python assembly loops
+
+Python cell-by-cell operations dominate a significant part of runtime.
+
+Direct LU fill-in
+
+MUMPS memory can increase much faster than the original number of cells.
+
+Communication cost
+
+More ranks add communication and synchronization.
+
+This means the current solver is significantly more scalable than V2, but it is not yet a million-cell fully domain-decomposed CFD implementation.
