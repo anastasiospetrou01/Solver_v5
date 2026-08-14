@@ -10,7 +10,7 @@ from __future__ import annotations
 # When mpi_ranks > 1, this script relaunches itself with mpiexec before NumPy,
 # SciPy or PETSc is imported.
 RUN_SETTINGS = {
-    "case_name": "buoyancy_cavity_1x1",
+    "case_name": "wake_test",
     "case_file": None,
 
     "use_previous_solution": False,
