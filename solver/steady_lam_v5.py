@@ -10,7 +10,7 @@ from __future__ import annotations
 # When mpi_ranks > 1, this script relaunches itself with mpiexec before NumPy,
 # SciPy or PETSc is imported.
 RUN_SETTINGS = {
-    "case_name": "wake_test",
+    "case_name": "buoyancy_cavity_1x1",
     "case_file": None,
 
     "use_previous_solution": False,
@@ -74,6 +74,10 @@ RUN_SETTINGS = {
         },
     },
 
+    "performance": {
+        "use_numba": True,
+    },
+
     "profiling": {
         "enabled": True,
         "print_per_iteration": True,
@@ -123,6 +127,7 @@ def _bootstrap_parallel_run() -> None:
     os.environ["OPENBLAS_NUM_THREADS"] = thread_value
     os.environ["MKL_NUM_THREADS"] = thread_value
     os.environ["NUMEXPR_NUM_THREADS"] = thread_value
+    os.environ["NUMBA_NUM_THREADS"] = thread_value
 
     detected_size = _detected_mpi_size()
     if detected_size is not None:
@@ -171,7 +176,7 @@ from pathlib import Path
 import numpy as np
 
 from case_io import load_case
-from geometry import build_fluid_index_map, build_masks
+from geometry import build_fluid_index_map, build_masks, build_solver_topology
 from initial_conditions import build_initial_flow, build_initial_temperature
 from linear_backend import create_linear_solver
 from materials import build_material_fields, build_source_fields, materials
@@ -193,6 +198,8 @@ from solver_utils import (
     compute_mass_residual,
     compute_pressure_gradients,
     fluid_at,
+    initialize_solver_workspace,
+    snapshot_fields,
 )
 
 
@@ -366,6 +373,7 @@ def _build_context(
         "enable_sou_limiter": (
             settings["schemes"].get("limiter", "none") != "none"
         ),
+        "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
     }
 
 
@@ -403,6 +411,16 @@ def main() -> None:
         p_ref_i,
         p_ref_j,
     )
+    ctx["topology"] = build_solver_topology(
+        nx=nx,
+        ny=ny,
+        is_fluid=is_fluid,
+        is_solid=is_solid,
+        index_data=index_data,
+        flow_boundaries=geom["boundaries"]["flow"],
+        heat_boundaries=geom["boundaries"]["heat"],
+    )
+    initialize_solver_workspace(ctx)
 
     linear_solver = create_linear_solver(settings["linear_solver"])
     mpi_rank = linear_solver.rank
@@ -420,6 +438,9 @@ def main() -> None:
         print(
             f"MPI ranks: {mpi_size} | "
             f"threads/rank: {int(RUN_SETTINGS['threads_per_rank'])}"
+        )
+        print(
+            "Performance path: Numba kernels + persistent PETSc fixed-COO updates"
         )
 
     use_previous_solution = bool(RUN_SETTINGS["use_previous_solution"])
@@ -496,12 +517,7 @@ def main() -> None:
     try:
         for iteration in range(1, max_iter + 1):
             iteration_start = time.perf_counter()
-            fields_old = {
-                "u": fields["u"].copy(),
-                "v": fields["v"].copy(),
-                "p": fields["p"].copy(),
-                "T": fields["T"].copy(),
-            }
+            fields_old = snapshot_fields(ctx, fields)
 
             fields, coeffs, fluxes = solve_pressure_velocity(
                 ctx,
@@ -510,6 +526,7 @@ def main() -> None:
                 coeffs,
                 transient=None,
                 linear_solver=linear_solver,
+                old_fields=fields_old,
             )
             flow_timing = fluxes.get("timing", {})
             gradients = fluxes["gradients"]
@@ -547,11 +564,19 @@ def main() -> None:
             )
             mass_residual = float(
                 compute_mass_residual(
-                    ctx, settings, fields, coeffs, gradients
+                    ctx, settings, fields, coeffs, gradients, fluxes=fluxes
                 )
             )
             metrics_time = time.perf_counter() - metrics_start
             outer_time = time.perf_counter() - iteration_start
+
+            # Phase A profiling reports the slowest MPI rank, which is the
+            # effective wall-clock cost of each synchronized stage.
+            if profiling_enabled:
+                flow_timing = linear_solver.reduce_timing_max(flow_timing)
+                energy_timing = linear_solver.reduce_timing_max(energy_timing)
+                metrics_time = linear_solver.allreduce_max(metrics_time)
+                outer_time = linear_solver.allreduce_max(outer_time)
 
             histories["hist_it"].append(iteration)
             histories["hist_du"].append(du_inf)
@@ -704,6 +729,9 @@ def main() -> None:
                     ),
                     "direct_solver": str(
                         RUN_SETTINGS["direct_solver"]["solver_type"]
+                    ),
+                    "use_numba": bool(
+                        RUN_SETTINGS.get("performance", {}).get("use_numba", True)
                     ),
                 },
                 "histories": histories,

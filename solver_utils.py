@@ -1,5 +1,13 @@
 import numpy as np
 
+from numerical_kernels import (
+    NUMBA_AVAILABLE,
+    cell_gradients_kernel,
+    face_fluxes_kernel,
+    mass_residual_kernel,
+    pressure_gradients_kernel,
+)
+
 
 # ============================================================
 # GENERIC SOLVER UTILITIES
@@ -212,73 +220,93 @@ def south_face_kind(ctx, i, j):
 
 
 # ------------------------------------------------------------
-# Gradients
+# Reusable workspace and Numba-backed gradients
 # ------------------------------------------------------------
+def initialize_solver_workspace(ctx):
+    """Allocate reusable full-field work arrays once per case."""
+    ny = int(ctx["ny"])
+    nx = int(ctx["nx"])
+    workspace = ctx.setdefault("workspace", {})
+
+    def ensure(name, shape=(ny, nx), fill=0.0):
+        array = workspace.get(name)
+        if array is None or array.shape != shape:
+            array = np.full(shape, fill, dtype=float)
+            workspace[name] = array
+        return array
+
+    ensure("dpdx")
+    ensure("dpdy")
+    ensure("grad_x_1")
+    ensure("grad_y_1")
+    ensure("grad_x_2")
+    ensure("grad_y_2")
+    ensure("old_u")
+    ensure("old_v")
+    ensure("old_p")
+    ensure("old_T")
+    ensure("me", (ny, max(nx - 1, 0)))
+    ensure("mn", (max(ny - 1, 0), nx))
+    return workspace
+
+
+def snapshot_fields(ctx, fields):
+    """Copy the nonlinear state into persistent work arrays without allocation."""
+    workspace = initialize_solver_workspace(ctx)
+    np.copyto(workspace["old_u"], fields["u"])
+    np.copyto(workspace["old_v"], fields["v"])
+    np.copyto(workspace["old_p"], fields["p"])
+    np.copyto(workspace["old_T"], fields["T"])
+    return {
+        "u": workspace["old_u"],
+        "v": workspace["old_v"],
+        "p": workspace["old_p"],
+        "T": workspace["old_T"],
+    }
+
+
+def require_numba(ctx):
+    if bool(ctx.get("use_numba", True)) and not NUMBA_AVAILABLE:
+        raise ImportError(
+            "RUN_SETTINGS requests Numba acceleration, but numba is not installed. "
+            "Install it in the cfd-petsc environment before running Solver V5."
+        )
+
+
 def compute_pressure_gradients(ctx, p):
-    nx = ctx["nx"]
-    ny = ctx["ny"]
-    dx = ctx["dx"]
-    dy = ctx["dy"]
-    fluid_cells = ctx["fluid_cells"]
-
-    dpdx = np.zeros((ny, nx))
-    dpdy = np.zeros((ny, nx))
-
-    for (i, j) in fluid_cells:
-        if fluid_at(ctx, i - 1, j) and fluid_at(ctx, i + 1, j):
-            dpdx[j, i] = (p[j, i + 1] - p[j, i - 1]) / (2.0 * dx)
-        elif fluid_at(ctx, i + 1, j):
-            dpdx[j, i] = (p[j, i + 1] - p[j, i]) / dx
-        elif fluid_at(ctx, i - 1, j):
-            dpdx[j, i] = (p[j, i] - p[j, i - 1]) / dx
-        else:
-            dpdx[j, i] = 0.0
-
-        if fluid_at(ctx, i, j - 1) and fluid_at(ctx, i, j + 1):
-            dpdy[j, i] = (p[j + 1, i] - p[j - 1, i]) / (2.0 * dy)
-        elif fluid_at(ctx, i, j + 1):
-            dpdy[j, i] = (p[j + 1, i] - p[j, i]) / dy
-        elif fluid_at(ctx, i, j - 1):
-            dpdy[j, i] = (p[j, i] - p[j - 1, i]) / dy
-        else:
-            dpdy[j, i] = 0.0
-
+    require_numba(ctx)
+    workspace = initialize_solver_workspace(ctx)
+    dpdx = workspace["dpdx"]
+    dpdy = workspace["dpdy"]
+    topology = ctx["topology"]
+    pressure_gradients_kernel(
+        np.asarray(p, dtype=float),
+        ctx["is_fluid"],
+        topology["fluid_i"],
+        topology["fluid_j"],
+        float(ctx["dx"]),
+        float(ctx["dy"]),
+        dpdx,
+        dpdy,
+    )
     return dpdx, dpdy
 
 
-def compute_cell_gradients(ctx, phi, active_mask):
-    nx = ctx["nx"]
-    ny = ctx["ny"]
-    dx = ctx["dx"]
-    dy = ctx["dy"]
-
-    gx_phi = np.zeros((ny, nx))
-    gy_phi = np.zeros((ny, nx))
-
-    for j in range(ny):
-        for i in range(nx):
-            if not active_mask[j, i]:
-                continue
-
-            if i > 0 and active_mask[j, i - 1] and i < nx - 1 and active_mask[j, i + 1]:
-                gx_phi[j, i] = (phi[j, i + 1] - phi[j, i - 1]) / (2.0 * dx)
-            elif i < nx - 1 and active_mask[j, i + 1]:
-                gx_phi[j, i] = (phi[j, i + 1] - phi[j, i]) / dx
-            elif i > 0 and active_mask[j, i - 1]:
-                gx_phi[j, i] = (phi[j, i] - phi[j, i - 1]) / dx
-            else:
-                gx_phi[j, i] = 0.0
-
-            if j > 0 and active_mask[j - 1, i] and j < ny - 1 and active_mask[j + 1, i]:
-                gy_phi[j, i] = (phi[j + 1, i] - phi[j - 1, i]) / (2.0 * dy)
-            elif j < ny - 1 and active_mask[j + 1, i]:
-                gy_phi[j, i] = (phi[j + 1, i] - phi[j, i]) / dy
-            elif j > 0 and active_mask[j - 1, i]:
-                gy_phi[j, i] = (phi[j, i] - phi[j - 1, i]) / dy
-            else:
-                gy_phi[j, i] = 0.0
-
-    return gx_phi, gy_phi
+def compute_cell_gradients(ctx, phi, active_mask, workspace_slot=1):
+    require_numba(ctx)
+    workspace = initialize_solver_workspace(ctx)
+    slot = 1 if int(workspace_slot) == 1 else 2
+    gx = workspace[f"grad_x_{slot}"]
+    gy = workspace[f"grad_y_{slot}"]
+    cell_gradients_kernel(
+        np.asarray(phi, dtype=float),
+        np.asarray(active_mask, dtype=np.bool_),
+        float(ctx["dx"]),
+        float(ctx["dy"]),
+        gx,
+        gy,
+    )
+    return gx, gy
 
 
 # ------------------------------------------------------------
@@ -475,170 +503,73 @@ def boundary_mdot(ctx, side, i, j, fields, coeffs, gradients):
 
 
 # ------------------------------------------------------------
-# Rhie-Chow face fluxes
+# Rhie-Chow face fluxes — Numba kernel with persistent arrays
 # ------------------------------------------------------------
 def compute_face_fluxes(ctx, settings, fields, coeffs, gradients):
-    nx = ctx["nx"]
-    ny = ctx["ny"]
-    me = np.zeros((ny, nx - 1))
-    mn = np.zeros((ny - 1, nx))
-
-    u = fields["u"]
-    v = fields["v"]
-    p = fields["p"]
-    T = fields["T"]
-    aPu = coeffs["aPu"]
-    aPv = coeffs["aPv"]
-    dpdx = gradients["dpdx"]
-    dpdy = gradients["dpdy"]
-
-    for j in range(ny):
-        for i in range(nx - 1):
-            if fluid_at(ctx, i, j) and fluid_at(ctx, i + 1, j):
-                dP = cell_volume(ctx, i, j) / max(aPu[j, i], 1e-30)
-                dE = cell_volume(ctx, i + 1, j) / max(aPu[j, i + 1], 1e-30)
-                de = 0.5 * (dP + dE)
-                ubar = 0.5 * (u[j, i] + u[j, i + 1])
-                dp_face = (p[j, i + 1] - p[j, i]) / dist_e(ctx, i, j)
-                dp_interp = 0.5 * (dpdx[j, i] + dpdx[j, i + 1])
-                ue = ubar - de * (dp_face - dp_interp)
-                rho_e = face_rho_x(ctx, i, j)
-                me[j, i] = rho_e * area_e(ctx, i, j) * ue
-
-    for j in range(ny - 1):
-        for i in range(nx):
-            if fluid_at(ctx, i, j) and fluid_at(ctx, i, j + 1):
-                dP = cell_volume(ctx, i, j) / max(aPv[j, i], 1e-30)
-                dN = cell_volume(ctx, i, j + 1) / max(aPv[j + 1, i], 1e-30)
-                dn = 0.5 * (dP + dN)
-                vbar = 0.5 * (v[j, i] + v[j + 1, i])
-                dp_face = (p[j + 1, i] - p[j, i]) / dist_n(ctx, i, j)
-                dp_interp = 0.5 * (dpdy[j, i] + dpdy[j + 1, i])
-
-                if settings["physics"].get("buoyancy", False):
-                    ByP = body_force_y(ctx, settings, i, j, T[j, i])
-                    ByN = body_force_y(ctx, settings, i, j, T[j + 1, i])
-                    By_face = 0.5 * (ByP + ByN)
-                    by_interp_term = 0.5 * (dP * ByP + dN * ByN)
-                    vn = vbar - dn * (dp_face - dp_interp) + (dn * By_face - by_interp_term)
-                else:
-                    vn = vbar - dn * (dp_face - dp_interp)
-
-                rho_n = face_rho_y(ctx, i, j)
-                mn[j, i] = rho_n * area_n(ctx, i, j) * vn
-
+    require_numba(ctx)
+    workspace = initialize_solver_workspace(ctx)
+    me = workspace["me"]
+    mn = workspace["mn"]
+    face_fluxes_kernel(
+        fields["u"],
+        fields["v"],
+        fields["p"],
+        fields["T"],
+        ctx["is_fluid"],
+        ctx["rho"],
+        ctx["beta"],
+        coeffs["aPu"],
+        coeffs["aPv"],
+        gradients["dpdx"],
+        gradients["dpdy"],
+        float(ctx["V"]),
+        float(ctx["dx"]),
+        float(ctx["dy"]),
+        float(ctx["T_ref"]),
+        float(ctx["gy"]),
+        bool(settings["physics"].get("buoyancy", False)),
+        me,
+        mn,
+    )
     return {"me": me, "mn": mn}
 
 
 # ------------------------------------------------------------
 # Residuals and balances
 # ------------------------------------------------------------
-def compute_mass_residual(ctx, settings, fields, coeffs, gradients):
-    u = fields["u"]
-    v = fields["v"]
-    p = fields["p"]
-    T = fields["T"]
-    aPu = coeffs["aPu"]
-    aPv = coeffs["aPv"]
-    dpdx = gradients["dpdx"]
-    dpdy = gradients["dpdy"]
-
-    mass_res = 0.0
-
-    for (i, j) in ctx["fluid_cells"]:
-        if ctx.get("use_pressure_reference", False) and i == ctx.get("p_ref_i") and j == ctx.get("p_ref_j"):
-            continue
-
-        kind_e = east_face_kind(ctx, i, j)
-        kind_w = west_face_kind(ctx, i, j)
-        kind_n = north_face_kind(ctx, i, j)
-        kind_s = south_face_kind(ctx, i, j)
-
-        if kind_e == "fluid-fluid":
-            dP = cell_volume(ctx, i, j) / max(aPu[j, i], 1e-30)
-            dE = cell_volume(ctx, i + 1, j) / max(aPu[j, i + 1], 1e-30)
-            de = 0.5 * (dP + dE)
-            rc_grad_e = 0.5 * (dpdx[j, i] + dpdx[j, i + 1])
-            rho_e = face_rho_x(ctx, i, j)
-            mdot_e = rho_e * area_e(ctx, i, j) * (
-                0.5 * (u[j, i] + u[j, i + 1]) - de * ((p[j, i + 1] - p[j, i]) / dist_e(ctx, i, j) - rc_grad_e)
-            )
-        elif kind_e == "boundary-east":
-            mdot_e = boundary_mdot(ctx, "east", i, j, fields, coeffs, gradients)
-        else:
-            mdot_e = 0.0
-
-        if kind_w == "fluid-fluid":
-            dW = cell_volume(ctx, i - 1, j) / max(aPu[j, i - 1], 1e-30)
-            dP = cell_volume(ctx, i, j) / max(aPu[j, i], 1e-30)
-            dw = 0.5 * (dW + dP)
-            rc_grad_w = 0.5 * (dpdx[j, i - 1] + dpdx[j, i])
-            rho_w = face_rho_x(ctx, i - 1, j)
-            mdot_w = rho_w * area_w(ctx, i, j) * (
-                0.5 * (u[j, i - 1] + u[j, i]) - dw * ((p[j, i] - p[j, i - 1]) / dist_w(ctx, i, j) - rc_grad_w)
-            )
-        elif kind_w == "boundary-west":
-            mdot_w = boundary_mdot(ctx, "west", i, j, fields, coeffs, gradients)
-        else:
-            mdot_w = 0.0
-
-        if kind_n == "fluid-fluid":
-            dP = cell_volume(ctx, i, j) / max(aPv[j, i], 1e-30)
-            dN = cell_volume(ctx, i, j + 1) / max(aPv[j + 1, i], 1e-30)
-            dn = 0.5 * (dP + dN)
-            rc_grad_n = 0.5 * (dpdy[j, i] + dpdy[j + 1, i])
-            rho_n = face_rho_y(ctx, i, j)
-
-            if settings["physics"].get("buoyancy", False):
-                ByP = body_force_y(ctx, settings, i, j, T[j, i])
-                ByN = body_force_y(ctx, settings, i, j, T[j + 1, i])
-                By_face = 0.5 * (ByP + ByN)
-                by_interp_term = 0.5 * (dP * ByP + dN * ByN)
-                mdot_n = rho_n * area_n(ctx, i, j) * (
-                    0.5 * (v[j, i] + v[j + 1, i])
-                    - dn * ((p[j + 1, i] - p[j, i]) / dist_n(ctx, i, j) - rc_grad_n)
-                    + (dn * By_face - by_interp_term)
-                )
-            else:
-                mdot_n = rho_n * area_n(ctx, i, j) * (
-                    0.5 * (v[j, i] + v[j + 1, i])
-                    - dn * ((p[j + 1, i] - p[j, i]) / dist_n(ctx, i, j) - rc_grad_n)
-                )
-        elif kind_n == "boundary-north":
-            mdot_n = boundary_mdot(ctx, "north", i, j, fields, coeffs, gradients)
-        else:
-            mdot_n = 0.0
-
-        if kind_s == "fluid-fluid":
-            dS = cell_volume(ctx, i, j - 1) / max(aPv[j - 1, i], 1e-30)
-            dP = cell_volume(ctx, i, j) / max(aPv[j, i], 1e-30)
-            ds = 0.5 * (dS + dP)
-            rc_grad_s = 0.5 * (dpdy[j - 1, i] + dpdy[j, i])
-            rho_s = face_rho_y(ctx, i, j - 1)
-
-            if settings["physics"].get("buoyancy", False):
-                ByS = body_force_y(ctx, settings, i, j, T[j - 1, i])
-                ByP = body_force_y(ctx, settings, i, j, T[j, i])
-                By_face = 0.5 * (ByS + ByP)
-                by_interp_term = 0.5 * (dS * ByS + dP * ByP)
-                mdot_s = rho_s * area_s(ctx, i, j) * (
-                    0.5 * (v[j - 1, i] + v[j, i])
-                    - ds * ((p[j, i] - p[j - 1, i]) / dist_s(ctx, i, j) - rc_grad_s)
-                    + (ds * By_face - by_interp_term)
-                )
-            else:
-                mdot_s = rho_s * area_s(ctx, i, j) * (
-                    0.5 * (v[j - 1, i] + v[j, i])
-                    - ds * ((p[j, i] - p[j - 1, i]) / dist_s(ctx, i, j) - rc_grad_s)
-                )
-        elif kind_s == "boundary-south":
-            mdot_s = boundary_mdot(ctx, "south", i, j, fields, coeffs, gradients)
-        else:
-            mdot_s = 0.0
-
-        mass_res = max(mass_res, abs(mdot_e - mdot_w + mdot_n - mdot_s))
-
-    return mass_res
+def compute_mass_residual(ctx, settings, fields, coeffs, gradients, fluxes=None):
+    """Maximum cell continuity imbalance using already reconstructed face fluxes."""
+    require_numba(ctx)
+    if fluxes is None:
+        fluxes = compute_face_fluxes(ctx, settings, fields, coeffs, gradients)
+    topology = ctx["topology"]
+    return float(
+        mass_residual_kernel(
+            topology["fluid_i"],
+            topology["fluid_j"],
+            topology["face_kind"],
+            topology["flow_bc_code"],
+            topology["flow_bc_u"],
+            topology["flow_bc_v"],
+            topology["flow_bc_p"],
+            fields["u"],
+            fields["v"],
+            fields["p"],
+            gradients["dpdx"],
+            gradients["dpdy"],
+            coeffs["aPu"],
+            coeffs["aPv"],
+            ctx["rho"],
+            fluxes["me"],
+            fluxes["mn"],
+            float(ctx["V"]),
+            float(ctx["dx"]),
+            float(ctx["dy"]),
+            bool(ctx.get("use_pressure_reference", False)),
+            int(ctx.get("p_ref_i", -1)),
+            int(ctx.get("p_ref_j", -1)),
+        )
+    )
 
 
 def compute_global_mass_balance(ctx, fields, coeffs, gradients):

@@ -1,20 +1,30 @@
 # ============================================================
-# COUPLED FLOW AND ENERGY EQUATIONS — DIRECT-LU PRODUCTION PATH
+# COUPLED FLOW AND ENERGY EQUATIONS — PHASE A/B/C OPTIMIZED
 # ============================================================
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import time
+from typing import Any, Dict
 
 import numpy as np
 
-from flow_assembly import assemble_flow_correction_system
-from solver_utils import compute_face_fluxes, compute_pressure_gradients
-
-
-def _component_indices(nf: int):
-    cells = np.arange(nf, dtype=int)
-    return 3 * cells, 3 * cells + 1, 3 * cells + 2
+from flow_assembly import (
+    FixedCSRPattern,
+    assemble_flow_correction_system,
+)
+from numerical_kernels import (
+    fill_energy_csr_kernel,
+    update_flow_fields_kernel,
+)
+from solver_utils import (
+    compute_cell_gradients,
+    compute_face_fluxes,
+    compute_pressure_gradients,
+    initialize_solver_workspace,
+    snapshot_fields,
+)
 
 
 def solve_pressure_velocity(
@@ -24,6 +34,7 @@ def solve_pressure_velocity(
     coeffs,
     transient=None,
     linear_solver=None,
+    old_fields=None,
 ):
     """Solve one nonlinear iteration of the fully coupled direct-LU system."""
     if transient is not None:
@@ -31,62 +42,39 @@ def solve_pressure_velocity(
             "Transient pressure-velocity terms are reserved for the transient solver."
         )
     if linear_solver is None:
-        raise ValueError(
-            "A PetscDirectSolver instance is required for the flow solve."
-        )
+        raise ValueError("A PetscDirectSolver instance is required for the flow solve.")
 
     timing_enabled = bool(settings.get("profiling", {}).get("enabled", False))
-    timing = {}
     total_start = time.perf_counter()
 
-    fields_old = {
-        "u": fields["u"].copy(),
-        "v": fields["v"].copy(),
-        "p": fields["p"].copy(),
-    }
+    if old_fields is None:
+        old_fields = snapshot_fields(ctx, fields)
 
-    assembly_start = time.perf_counter()
     system = assemble_flow_correction_system(
         ctx,
         settings,
         fields,
         coeffs,
-        distributed=bool(linear_solver.uses_local_flow_assembly()),
+        distributed=True,
     )
-    timing["flow_assembly_total"] = time.perf_counter() - assembly_start
-    timing["flow_matrix_alloc"] = 0.0
-    timing["flow_assembly_loop"] = timing["flow_assembly_total"]
-    timing["flow_pressure_reference"] = 0.0
-    timing["flow_initial_guess"] = 0.0
-    timing["flow_pre_flux"] = 0.0
+    timing = dict(system.assembly_timing)
 
     linear_start = time.perf_counter()
-    if system.is_distributed_local:
-        scaled_correction = linear_solver.solve(
-            system,
-            None,
-            system_type="flow_coupled",
-            metadata=system.metadata,
-        )
-    else:
-        scaled_correction = linear_solver.solve(
-            system.scaled_matrix,
-            system.scaled_rhs,
-            system_type="flow_coupled",
-            metadata=system.metadata,
-        )
+    scaled_correction = linear_solver.solve(
+        system,
+        None,
+        system_type="flow_coupled",
+        metadata=system.metadata,
+    )
     timing["flow_linear_solve"] = time.perf_counter() - linear_start
 
     if not np.all(np.isfinite(scaled_correction)):
         raise RuntimeError("The direct linear solver returned non-finite corrections.")
 
     correction = system.recover_correction(scaled_correction)
-    nf = int(ctx["Nf"])
     backend_info = linear_solver.last_info
     backend_extra = backend_info.extra if backend_info is not None else {}
-    true_rel = float(
-        backend_extra.get("unscaled_true_rel_residual", np.inf)
-    )
+    true_rel = float(backend_extra.get("unscaled_true_rel_residual", np.inf))
     allowed = float(
         settings.get("linear_solver", {})
         .get("flow_coupled", {})
@@ -95,26 +83,25 @@ def solve_pressure_velocity(
     if true_rel > allowed:
         raise RuntimeError(
             "The coupled correction does not satisfy the original unscaled system: "
-            f"true relative infinity residual={true_rel:.6e}, "
-            f"allowed={allowed:.6e}."
+            f"true relative infinity residual={true_rel:.6e}, allowed={allowed:.6e}."
         )
-
-    alpha_u = float(settings["relaxation"]["u"])
-    alpha_v = float(settings["relaxation"]["v"])
-    alpha_p = float(settings["relaxation"]["p"])
 
     update_start = time.perf_counter()
-    for fid, (i, j) in enumerate(ctx["fluid_cells"]):
-        fields["u"][j, i] = (
-            fields_old["u"][j, i] + alpha_u * correction[3 * fid]
-        )
-        fields["v"][j, i] = (
-            fields_old["v"][j, i] + alpha_v * correction[3 * fid + 1]
-        )
-        fields["p"][j, i] = (
-            fields_old["p"][j, i] + alpha_p * correction[3 * fid + 2]
-        )
-
+    topology = ctx["topology"]
+    update_flow_fields_kernel(
+        topology["fluid_i"],
+        topology["fluid_j"],
+        old_fields["u"],
+        old_fields["v"],
+        old_fields["p"],
+        correction,
+        float(settings["relaxation"]["u"]),
+        float(settings["relaxation"]["v"]),
+        float(settings["relaxation"]["p"]),
+        fields["u"],
+        fields["v"],
+        fields["p"],
+    )
     fields["u"][ctx["is_solid"]] = 0.0
     fields["v"][ctx["is_solid"]] = 0.0
     fields["p"][ctx["is_solid"]] = 0.0
@@ -128,14 +115,13 @@ def solve_pressure_velocity(
             and 0 <= j_ref < ctx["ny"]
             and ctx["is_fluid"][j_ref, i_ref]
         ):
-            fields["p"][j_ref, i_ref] = float(
-                pressure_cfg.get("value", 0.0)
-            )
+            fields["p"][j_ref, i_ref] = float(pressure_cfg.get("value", 0.0))
     timing["flow_field_update"] = time.perf_counter() - update_start
 
     coefficient_start = time.perf_counter()
-    coeffs["aPu"] = system.momentum.aPu.copy()
-    coeffs["aPv"] = system.momentum.aPv.copy()
+    # Keep lagged coefficient arrays persistent and overwrite them in-place.
+    np.copyto(coeffs["aPu"], system.momentum.aPu)
+    np.copyto(coeffs["aPv"], system.momentum.aPv)
     timing["flow_coeff_update"] = time.perf_counter() - coefficient_start
 
     flux_start = time.perf_counter()
@@ -168,318 +154,314 @@ def solve_pressure_velocity(
     backend_timing = backend_extra.get("timing", {})
     if backend_timing:
         timing["backend"] = dict(backend_timing)
+    local_stats = backend_extra.get("local_assembly_stats", {})
+    if isinstance(local_stats, dict):
+        for key in ("coo_value_fill", "coo_matrix_update", "coo_rhs_update"):
+            if key in local_stats:
+                timing[f"flow_{key}"] = float(local_stats[key])
 
     timing["flow_total"] = time.perf_counter() - total_start
     if timing_enabled:
         fluxes["timing"] = timing
-
     return fields, coeffs, fluxes
 
 
 # ============================================================
-# ENERGY EQUATION SECTION
+# ENERGY EQUATION — FIXED FIVE-POINT COO PATTERN
 # ============================================================
 
-from scipy.sparse import lil_matrix
+
+def build_energy_pattern(ctx) -> FixedCSRPattern:
+    existing = ctx.get("energy_pattern")
+    if existing is not None:
+        return existing
+
+    nx = int(ctx["nx"])
+    ny = int(ctx["ny"])
+    neighbor = ctx["topology"]["cell_neighbor"]
+    ncell = nx * ny
+    indptr = [0]
+    indices = []
+
+    for cell in range(ncell):
+        cols = [cell]
+        for direction in range(4):
+            nb = int(neighbor[cell, direction])
+            if nb >= 0:
+                cols.append(nb)
+        indices.extend(cols)
+        indptr.append(len(indices))
+
+    pattern = FixedCSRPattern(
+        indptr=np.asarray(indptr, dtype=np.int64),
+        indices=np.asarray(indices, dtype=np.int64),
+        pattern_key=(
+            "v5_phase_abc_energy_coo",
+            nx,
+            ny,
+            ncell,
+            len(indices),
+        ),
+    )
+    ctx["energy_pattern"] = pattern
+    return pattern
+
+
+@dataclass
+class EnergyCOOLinearSystem:
+    ctx: Dict[str, Any]
+    pattern: FixedCSRPattern
+    data: np.ndarray
+    rhs_global: np.ndarray
+
+    is_fixed_coo: bool = True
+    is_distributed_local: bool = False
+    block_size: int = 1
+
+    @property
+    def global_size(self) -> int:
+        return int(self.rhs_global.size)
+
+    @property
+    def pattern_key(self):
+        return self.pattern.pattern_key
+
+    @property
+    def metadata(self):
+        return {
+            "block_size": 1,
+            "fixed_coo": True,
+            "pattern_key": self.pattern_key,
+        }
+
+    def local_coo_pattern(self, row_start: int, row_end: int):
+        rows, cols, _nz0, _nz1 = self.pattern.local_coo(row_start, row_end)
+        return rows, cols
+
+    def assemble_petsc(self, mat, rhs_vec, row_start: int, row_end: int):
+        from petsc4py import PETSc
+
+        _rows, _cols, nz_start, nz_end = self.pattern.local_coo(
+            row_start, row_end
+        )
+        stage = time.perf_counter()
+        mat.setValuesCOO(
+            np.asarray(self.data[nz_start:nz_end], dtype=PETSc.ScalarType),
+            addv=PETSc.InsertMode.INSERT_VALUES,
+        )
+        coo_matrix = time.perf_counter() - stage
+
+        stage = time.perf_counter()
+        rhs_array = rhs_vec.getArray()
+        rhs_array[:] = np.asarray(
+            self.rhs_global[row_start:row_end], dtype=rhs_array.dtype
+        )
+        rhs_vec.assemble()
+        rhs_update = time.perf_counter() - stage
+        return {
+            "local_rows": float(row_end - row_start),
+            "coo_value_fill": 0.0,
+            "coo_matrix_update": coo_matrix,
+            "coo_rhs_update": rhs_update,
+        }
+
+
+def assemble_energy_fixed_system(ctx, settings, fields, fluxes):
+    """Fill the fixed energy matrix numerical values without SciPy LIL/COO rebuilds."""
+    timing: Dict[str, float] = {}
+    pattern = build_energy_pattern(ctx)
+    workspace = initialize_solver_workspace(ctx)
+
+    data = workspace.get("energy_matrix_data")
+    if data is None or data.size != pattern.nnz:
+        data = np.empty(pattern.nnz, dtype=float)
+        workspace["energy_matrix_data"] = data
+    rhs = workspace.get("energy_rhs")
+    ncell = int(ctx["nx"]) * int(ctx["ny"])
+    if rhs is None or rhs.size != ncell:
+        rhs = np.empty(ncell, dtype=float)
+        workspace["energy_rhs"] = rhs
+
+    energy_scheme = str(settings["schemes"].get("energy", "upwind")).lower()
+    sou_enabled = (
+        energy_scheme == "sou"
+        and float(settings["schemes"].get("energy_blend", 0.0)) != 0.0
+    )
+
+    stage = time.perf_counter()
+    if sou_enabled:
+        dTdx, dTdy = compute_cell_gradients(
+            ctx, fields["T"], ctx["is_fluid"], workspace_slot=1
+        )
+    else:
+        dTdx = workspace["grad_x_1"]
+        dTdy = workspace["grad_y_1"]
+    timing["energy_gradient"] = time.perf_counter() - stage
+
+    stage = time.perf_counter()
+    fill_energy_csr_kernel(
+        int(ctx["nx"]),
+        int(ctx["ny"]),
+        pattern.indptr,
+        ctx["topology"]["cell_face_kind"],
+        ctx["topology"]["cell_neighbor"],
+        ctx["topology"]["heat_bc_code"],
+        ctx["topology"]["heat_bc_T"],
+        ctx["topology"]["heat_bc_q"],
+        ctx["is_fluid"],
+        ctx["k"],
+        ctx["qdot"],
+        fields["T"],
+        fluxes["me"],
+        fluxes["mn"],
+        dTdx,
+        dTdy,
+        float(ctx["dx"]),
+        float(ctx["dy"]),
+        float(ctx["V"]),
+        sou_enabled,
+        float(settings["schemes"].get("energy_blend", 0.0)),
+        bool(ctx.get("enable_sou_limiter", True)),
+        data,
+        rhs,
+    )
+    timing["energy_value_fill"] = time.perf_counter() - stage
+    timing["energy_assembly_total"] = (
+        timing["energy_gradient"] + timing["energy_value_fill"]
+    )
+    return EnergyCOOLinearSystem(ctx, pattern, data, rhs), timing
+
+
+def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=None):
+    if transient is not None:
+        raise NotImplementedError(
+            "Transient energy term is reserved for the transient solver."
+        )
+    if linear_solver is None:
+        raise ValueError("A PetscDirectSolver instance is required for the energy solve.")
+
+    timing_enabled = bool(settings.get("profiling", {}).get("enabled", False))
+    timing: Dict[str, Any] = {}
+    total_start = time.perf_counter()
+
+    system, assembly_timing = assemble_energy_fixed_system(
+        ctx, settings, fields, fluxes
+    )
+    timing.update(assembly_timing)
+
+    stage = time.perf_counter()
+    T_vec = linear_solver.solve(
+        system,
+        None,
+        system_type="energy",
+        x0=fields["T"].reshape(-1),
+        metadata=system.metadata,
+    )
+    timing["energy_linear_solve"] = time.perf_counter() - stage
+
+    if not np.all(np.isfinite(T_vec)):
+        raise RuntimeError("Energy linear solve produced non-finite values.")
+
+    stage = time.perf_counter()
+    T_old = fields["T"]
+    T_new = T_vec.reshape((int(ctx["ny"]), int(ctx["nx"])))
+    alpha_T = float(settings["relaxation"]["T"])
+    workspace = initialize_solver_workspace(ctx)
+    relaxed = workspace.get("energy_relaxed")
+    if relaxed is None or relaxed.shape != T_old.shape:
+        relaxed = np.empty_like(T_old)
+        workspace["energy_relaxed"] = relaxed
+    np.add(
+        alpha_T * T_new,
+        (1.0 - alpha_T) * T_old,
+        out=relaxed,
+    )
+    timing["energy_field_update"] = time.perf_counter() - stage
+
+    backend_info = getattr(linear_solver, "last_info", None)
+    backend_extra = (
+        getattr(backend_info, "extra", {}) if backend_info is not None else {}
+    )
+    backend_timing = (
+        backend_extra.get("timing", {})
+        if isinstance(backend_extra, dict)
+        else {}
+    )
+    if backend_timing:
+        timing["backend"] = dict(backend_timing)
+    local_stats = (
+        backend_extra.get("local_assembly_stats", {})
+        if isinstance(backend_extra, dict)
+        else {}
+    )
+    if isinstance(local_stats, dict):
+        for key in ("coo_value_fill", "coo_matrix_update", "coo_rhs_update"):
+            if key in local_stats:
+                timing[f"energy_{key}"] = float(local_stats[key])
+
+    timing["energy_total"] = time.perf_counter() - total_start
+    if timing_enabled:
+        settings["_last_energy_timing"] = timing
+    return relaxed
+
+
+# ============================================================
+# ENERGY BALANCE CONDUCTANCE HELPERS — retained for reporting
+# ============================================================
 
 from solver_utils import (
-    fluid_at,
-    heat_bc_type, heat_bc_T, heat_bc_q,
-    upwind_aE, upwind_aW, upwind_aN, upwind_aS,
+    area_e,
+    area_n,
+    area_s,
+    area_w,
+    dist_e,
+    dist_n,
+    dist_s,
+    dist_w,
+    east_face_kind,
+    heat_bc_type,
     harmonic_mean,
-    east_face_kind, west_face_kind, north_face_kind, south_face_kind,
-    compute_cell_gradients,
-    sou_deferred_source,
-    cell_volume,
-    area_e, area_w, area_n, area_s,
-    dist_e, dist_w, dist_n, dist_s,
+    north_face_kind,
+    south_face_kind,
+    west_face_kind,
 )
 
 
-# ============================================================
-# ENERGY EQUATION UTILITIES
-# ------------------------------------------------------------
-# Kept separate from the main solver so steady/transient solvers
-# can reuse the same energy assembly. Current implementation is
-# steady; transient hook is reserved for later.
-# ============================================================
-
-
-def tidx(ctx, i, j):
-    return j * ctx["nx"] + i
-
-
 def east_conductance(ctx, i, j):
-    k = ctx["k"]
-    kP = k[j, i]
+    kP = ctx["k"][j, i]
     kind = east_face_kind(ctx, i, j)
     if kind in ("fluid-fluid", "fluid-solid"):
-        kE = k[j, i + 1]
-        kf = harmonic_mean(kP, kE)
-        return kf * area_e(ctx, i, j) / dist_e(ctx, i, j)
+        return harmonic_mean(kP, ctx["k"][j, i + 1]) * area_e(ctx, i, j) / dist_e(ctx, i, j)
     if kind == "boundary-east" and heat_bc_type(ctx, "east") == "dirichlet":
         return 2.0 * kP * area_e(ctx, i, j) / dist_e(ctx, i, j)
     return 0.0
 
 
 def west_conductance(ctx, i, j):
-    k = ctx["k"]
-    kP = k[j, i]
+    kP = ctx["k"][j, i]
     kind = west_face_kind(ctx, i, j)
     if kind in ("fluid-fluid", "fluid-solid"):
-        kW = k[j, i - 1]
-        kf = harmonic_mean(kP, kW)
-        return kf * area_w(ctx, i, j) / dist_w(ctx, i, j)
+        return harmonic_mean(kP, ctx["k"][j, i - 1]) * area_w(ctx, i, j) / dist_w(ctx, i, j)
     if kind == "boundary-west" and heat_bc_type(ctx, "west") == "dirichlet":
         return 2.0 * kP * area_w(ctx, i, j) / dist_w(ctx, i, j)
     return 0.0
 
 
 def north_conductance(ctx, i, j):
-    k = ctx["k"]
-    kP = k[j, i]
+    kP = ctx["k"][j, i]
     kind = north_face_kind(ctx, i, j)
     if kind in ("fluid-fluid", "fluid-solid"):
-        kN = k[j + 1, i]
-        kf = harmonic_mean(kP, kN)
-        return kf * area_n(ctx, i, j) / dist_n(ctx, i, j)
+        return harmonic_mean(kP, ctx["k"][j + 1, i]) * area_n(ctx, i, j) / dist_n(ctx, i, j)
     if kind == "boundary-north" and heat_bc_type(ctx, "north") == "dirichlet":
         return 2.0 * kP * area_n(ctx, i, j) / dist_n(ctx, i, j)
     return 0.0
 
 
 def south_conductance(ctx, i, j):
-    k = ctx["k"]
-    kP = k[j, i]
+    kP = ctx["k"][j, i]
     kind = south_face_kind(ctx, i, j)
     if kind in ("fluid-fluid", "fluid-solid"):
-        kS = k[j - 1, i]
-        kf = harmonic_mean(kP, kS)
-        return kf * area_s(ctx, i, j) / dist_s(ctx, i, j)
+        return harmonic_mean(kP, ctx["k"][j - 1, i]) * area_s(ctx, i, j) / dist_s(ctx, i, j)
     if kind == "boundary-south" and heat_bc_type(ctx, "south") == "dirichlet":
         return 2.0 * kP * area_s(ctx, i, j) / dist_s(ctx, i, j)
     return 0.0
-
-
-def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=None):
-    """
-    Solve the current steady energy equation.
-
-    Parameters
-    ----------
-    ctx : dict
-        Case/grid/material/boundary context.
-    settings : dict
-        Solver controls, physics flags, schemes, relaxation values.
-    fields : dict
-        Current solution fields. Must contain T.
-    fluxes : dict
-        Face mass fluxes: me and mn.
-    transient : None or dict
-        Reserved for future transient energy source terms.
-    linear_solver : PetscDirectSolver
-        Persistent PETSc/MUMPS backend used for the energy system.
-    """
-    if linear_solver is None:
-        raise ValueError(
-            "A PetscDirectSolver instance is required for the energy solve."
-        )
-
-    profiling_settings = settings.get("profiling", {})
-    timing_enabled = bool(profiling_settings.get("enabled", False))
-    timing = {}
-    t_total = time.perf_counter()
-
-    nx = ctx["nx"]
-    ny = ctx["ny"]
-    N = nx * ny
-    is_fluid = ctx["is_fluid"]
-    k = ctx["k"]
-    qdot = ctx["qdot"]
-    T_old = fields["T"]
-    me = fluxes["me"]
-    mn = fluxes["mn"]
-
-    alpha_T = settings["relaxation"]["T"]
-    energy_scheme = settings["schemes"].get("energy", "upwind").lower()
-    energy_blend = float(settings["schemes"].get("energy_blend", 0.0))
-
-    t_stage = time.perf_counter()
-    A = lil_matrix((N, N))
-    b = np.zeros(N)
-    if timing_enabled:
-        timing["energy_matrix_alloc"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    if energy_scheme == "sou" and energy_blend != 0.0:
-        dTdx, dTdy = compute_cell_gradients(ctx, T_old, is_fluid)
-    else:
-        dTdx = dTdy = None
-    if timing_enabled:
-        timing["energy_gradient"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    for j in range(ny):
-        for i in range(nx):
-            P = tidx(ctx, i, j)
-            kP = k[j, i]
-
-            aE = aW = aN = aS = 0.0
-            Su = 0.0
-            Sp = 0.0
-
-            kind_e = east_face_kind(ctx, i, j)
-            kind_w = west_face_kind(ctx, i, j)
-            kind_n = north_face_kind(ctx, i, j)
-            kind_s = south_face_kind(ctx, i, j)
-
-            if kind_e in ("fluid-fluid", "fluid-solid"):
-                kf = harmonic_mean(kP, k[j, i + 1])
-                De = kf * area_e(ctx, i, j) / dist_e(ctx, i, j)
-                if is_fluid[j, i] and fluid_at(ctx, i + 1, j):
-                    Fe = me[j, i]
-                    aE = upwind_aE(Fe, De)
-                else:
-                    aE = De
-            elif kind_e == "boundary-east":
-                bct = heat_bc_type(ctx, "east")
-                if bct == "dirichlet":
-                    coeff = 2.0 * kP * area_e(ctx, i, j) / dist_e(ctx, i, j)
-                    Sp -= coeff
-                    Su += coeff * heat_bc_T(ctx, "east")
-                elif bct == "neumann":
-                    Su += heat_bc_q(ctx, "east") * area_e(ctx, i, j)
-                elif bct in ("adiabatic", "symmetry", "outlet", "open"):
-                    pass
-                else:
-                    raise ValueError(f"Unsupported east heat BC type: {bct}")
-
-            if kind_w in ("fluid-fluid", "fluid-solid"):
-                kf = harmonic_mean(kP, k[j, i - 1])
-                Dw = kf * area_w(ctx, i, j) / dist_w(ctx, i, j)
-                if is_fluid[j, i] and fluid_at(ctx, i - 1, j):
-                    Fw = me[j, i - 1]
-                    aW = upwind_aW(Fw, Dw)
-                else:
-                    aW = Dw
-            elif kind_w == "boundary-west":
-                bct = heat_bc_type(ctx, "west")
-                if bct == "dirichlet":
-                    coeff = 2.0 * kP * area_w(ctx, i, j) / dist_w(ctx, i, j)
-                    Sp -= coeff
-                    Su += coeff * heat_bc_T(ctx, "west")
-                elif bct == "neumann":
-                    Su += heat_bc_q(ctx, "west") * area_w(ctx, i, j)
-                elif bct in ("adiabatic", "symmetry", "outlet", "open"):
-                    pass
-                else:
-                    raise ValueError(f"Unsupported west heat BC type: {bct}")
-
-            if kind_n in ("fluid-fluid", "fluid-solid"):
-                kf = harmonic_mean(kP, k[j + 1, i])
-                Dn = kf * area_n(ctx, i, j) / dist_n(ctx, i, j)
-                if is_fluid[j, i] and fluid_at(ctx, i, j + 1):
-                    Fn = mn[j, i]
-                    aN = upwind_aN(Fn, Dn)
-                else:
-                    aN = Dn
-            elif kind_n == "boundary-north":
-                bct = heat_bc_type(ctx, "north")
-                if bct == "dirichlet":
-                    coeff = 2.0 * kP * area_n(ctx, i, j) / dist_n(ctx, i, j)
-                    Sp -= coeff
-                    Su += coeff * heat_bc_T(ctx, "north")
-                elif bct == "neumann":
-                    Su += heat_bc_q(ctx, "north") * area_n(ctx, i, j)
-                elif bct in ("adiabatic", "symmetry", "outlet", "open"):
-                    pass
-                else:
-                    raise ValueError(f"Unsupported north heat BC type: {bct}")
-
-            if kind_s in ("fluid-fluid", "fluid-solid"):
-                kf = harmonic_mean(kP, k[j - 1, i])
-                Ds = kf * area_s(ctx, i, j) / dist_s(ctx, i, j)
-                if is_fluid[j, i] and fluid_at(ctx, i, j - 1):
-                    Fs = mn[j - 1, i]
-                    aS = upwind_aS(Fs, Ds)
-                else:
-                    aS = Ds
-            elif kind_s == "boundary-south":
-                bct = heat_bc_type(ctx, "south")
-                if bct == "dirichlet":
-                    coeff = 2.0 * kP * area_s(ctx, i, j) / dist_s(ctx, i, j)
-                    Sp -= coeff
-                    Su += coeff * heat_bc_T(ctx, "south")
-                elif bct == "neumann":
-                    Su += heat_bc_q(ctx, "south") * area_s(ctx, i, j)
-                elif bct in ("adiabatic", "symmetry", "outlet", "open"):
-                    pass
-                else:
-                    raise ValueError(f"Unsupported south heat BC type: {bct}")
-
-            if energy_scheme == "sou" and energy_blend != 0.0 and is_fluid[j, i]:
-                Fe_corr = me[j, i] if kind_e == "fluid-fluid" else 0.0
-                Fw_corr = me[j, i - 1] if kind_w == "fluid-fluid" else 0.0
-                Fn_corr = mn[j, i] if kind_n == "fluid-fluid" else 0.0
-                Fs_corr = mn[j - 1, i] if kind_s == "fluid-fluid" else 0.0
-
-                Su += sou_deferred_source(
-                    ctx, T_old, dTdx, dTdy, i, j, Fe_corr, Fw_corr, Fn_corr, Fs_corr,
-                    kind_e, kind_w, kind_n, kind_s, energy_blend
-                )
-
-            # Steady volumetric heat source [W/m^3] * cell volume.
-            Su += qdot[j, i] * cell_volume(ctx, i, j)
-
-            # Reserved transient hook. Not active unless transient is supplied later.
-            if transient is not None:
-                raise NotImplementedError("Transient energy term is reserved for the next solver phase.")
-
-            aP = max(aE + aW + aN + aS - Sp, 1e-30)
-            A[P, P] = aP
-
-            if i < nx - 1 and kind_e in ("fluid-fluid", "fluid-solid"):
-                A[P, tidx(ctx, i + 1, j)] = -aE
-            if i > 0 and kind_w in ("fluid-fluid", "fluid-solid"):
-                A[P, tidx(ctx, i - 1, j)] = -aW
-            if j < ny - 1 and kind_n in ("fluid-fluid", "fluid-solid"):
-                A[P, tidx(ctx, i, j + 1)] = -aN
-            if j > 0 and kind_s in ("fluid-fluid", "fluid-solid"):
-                A[P, tidx(ctx, i, j - 1)] = -aS
-
-            b[P] = Su
-
-    if timing_enabled:
-        timing["energy_assembly_loop"] = time.perf_counter() - t_stage
-
-    t_stage = time.perf_counter()
-    T_vec = linear_solver.solve(
-        A,
-        b,
-        system_type="energy",
-        x0=T_old.reshape(-1),
-    )
-    if timing_enabled:
-        timing["energy_linear_solve"] = time.perf_counter() - t_stage
-        backend_info = getattr(linear_solver, "last_info", None)
-        backend_extra = getattr(backend_info, "extra", {}) if backend_info is not None else {}
-        backend_timing = backend_extra.get("timing", {}) if isinstance(backend_extra, dict) else {}
-        if backend_timing:
-            timing["backend"] = dict(backend_timing)
-
-    if not np.all(np.isfinite(T_vec)):
-        raise RuntimeError("Energy linear solve produced non-finite values.")
-
-    t_stage = time.perf_counter()
-    T_new = T_vec.reshape((ny, nx))
-    T_relaxed = alpha_T * T_new + (1.0 - alpha_T) * T_old
-    if timing_enabled:
-        timing["energy_field_update"] = time.perf_counter() - t_stage
-        timing["energy_total"] = time.perf_counter() - t_total
-        timing["energy_assembly_total"] = (
-            timing.get("energy_matrix_alloc", 0.0)
-            + timing.get("energy_gradient", 0.0)
-            + timing.get("energy_assembly_loop", 0.0)
-        )
-        settings["_last_energy_timing"] = timing
-    return T_relaxed

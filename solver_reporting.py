@@ -209,60 +209,72 @@ def make_profile_record(
     flow_timing: Dict[str, Any],
     energy_timing: Dict[str, Any],
 ) -> Dict[str, float]:
-    backend = flow_timing.get("backend", {}) if flow_timing else {}
-    flow_assembly = float(flow_timing.get("flow_assembly_total", 0.0))
-    flow_linear = float(flow_timing.get("flow_linear_solve", 0.0))
-    backend_total = float(backend.get("total", 0.0))
-    matrix_update = float(backend.get("matrix_rhs_update", 0.0))
-    factorization = float(backend.get("factorization_setup", 0.0))
-    triangular_solve = float(backend.get("triangular_solve", 0.0))
-    residual_check = float(backend.get("true_residual_check", 0.0))
+    """Flatten already MPI-MAX-reduced stage timings into one CSV record."""
+    flow_timing = flow_timing or {}
+    energy_timing = energy_timing or {}
+    flow_backend = flow_timing.get("backend", {}) or {}
+    energy_backend = energy_timing.get("backend", {}) or {}
 
     return {
         "iteration": int(iteration),
         "outer_total_s": float(outer_time),
         "metrics_s": float(metrics_time),
+
         "flow_total_s": float(flow_timing.get("flow_total", 0.0)),
-        "flow_assembly_total_s": flow_assembly,
-        "flow_linear_solve_s": flow_linear,
-        "flow_field_update_s": float(
-            flow_timing.get("flow_field_update", 0.0)
-        ),
-        "flow_coeff_update_s": float(
-            flow_timing.get("flow_coeff_update", 0.0)
-        ),
+        "flow_assembly_total_s": float(flow_timing.get("flow_assembly_total", 0.0)),
+        "flow_momentum_pass_s": float(flow_timing.get("flow_momentum_pass", 0.0)),
+        "momentum_pressure_gradient_s": float(flow_timing.get("momentum_pressure_gradient", 0.0)),
+        "momentum_pre_flux_s": float(flow_timing.get("momentum_pre_flux", 0.0)),
+        "momentum_sou_gradients_s": float(flow_timing.get("momentum_sou_gradients", 0.0)),
+        "momentum_coefficients_s": float(flow_timing.get("momentum_coefficients", 0.0)),
+        "flow_pattern_lookup_s": float(flow_timing.get("flow_pattern_lookup", 0.0)),
+        "flow_state_vector_s": float(flow_timing.get("flow_state_vector", 0.0)),
+        "flow_scaling_s": float(flow_timing.get("flow_scaling", 0.0)),
+        "flow_linear_solve_s": float(flow_timing.get("flow_linear_solve", 0.0)),
+        "flow_field_update_s": float(flow_timing.get("flow_field_update", 0.0)),
+        "flow_coeff_update_s": float(flow_timing.get("flow_coeff_update", 0.0)),
         "flow_post_flux_s": float(flow_timing.get("flow_post_flux", 0.0)),
-        "backend_total_s": backend_total,
-        "backend_matrix_rhs_update_s": matrix_update,
-        "backend_factorization_setup_s": factorization,
-        "backend_triangular_solve_s": triangular_solve,
-        "backend_solution_gather_s": float(
-            backend.get("solution_gather", 0.0)
-        ),
-        "backend_true_residual_check_s": residual_check,
+        "flow_coo_value_fill_s": float(flow_timing.get("flow_coo_value_fill", 0.0)),
+        "flow_coo_matrix_update_s": float(flow_timing.get("flow_coo_matrix_update", 0.0)),
+        "flow_coo_rhs_update_s": float(flow_timing.get("flow_coo_rhs_update", 0.0)),
+
+        "flow_backend_total_s": float(flow_backend.get("total", 0.0)),
+        "flow_backend_matrix_rhs_update_s": float(flow_backend.get("matrix_rhs_update", 0.0)),
+        "flow_backend_factorization_s": float(flow_backend.get("factorization_setup", 0.0)),
+        "flow_backend_solve_s": float(flow_backend.get("triangular_solve", 0.0)),
+        "flow_backend_solution_gather_s": float(flow_backend.get("solution_gather", 0.0)),
+        "flow_backend_residual_check_s": float(flow_backend.get("true_residual_check", 0.0)),
+
         "energy_total_s": float(energy_timing.get("energy_total", 0.0)),
-        "energy_assembly_total_s": float(
-            energy_timing.get("energy_assembly_total", 0.0)
-        ),
-        "energy_linear_solve_s": float(
-            energy_timing.get("energy_linear_solve", 0.0)
-        ),
+        "energy_assembly_total_s": float(energy_timing.get("energy_assembly_total", 0.0)),
+        "energy_gradient_s": float(energy_timing.get("energy_gradient", 0.0)),
+        "energy_value_fill_s": float(energy_timing.get("energy_value_fill", 0.0)),
+        "energy_linear_solve_s": float(energy_timing.get("energy_linear_solve", 0.0)),
+        "energy_field_update_s": float(energy_timing.get("energy_field_update", 0.0)),
+        "energy_coo_matrix_update_s": float(energy_timing.get("energy_coo_matrix_update", 0.0)),
+        "energy_coo_rhs_update_s": float(energy_timing.get("energy_coo_rhs_update", 0.0)),
+
+        "energy_backend_total_s": float(energy_backend.get("total", 0.0)),
+        "energy_backend_matrix_rhs_update_s": float(energy_backend.get("matrix_rhs_update", 0.0)),
+        "energy_backend_factorization_s": float(energy_backend.get("factorization_setup", 0.0)),
+        "energy_backend_solve_s": float(energy_backend.get("triangular_solve", 0.0)),
+        "energy_backend_solution_gather_s": float(energy_backend.get("solution_gather", 0.0)),
+        "energy_backend_residual_check_s": float(energy_backend.get("true_residual_check", 0.0)),
     }
 
 
 def print_iteration_timing(record: Dict[str, float]) -> None:
     print(
-        "    Timing | "
+        "    Timing(max-rank) | "
         f"outer={record['outer_total_s']:.3f}s | "
-        f"flow={record['flow_total_s']:.3f}s | "
-        f"assembly={record['flow_assembly_total_s']:.3f}s | "
-        f"linear={record['flow_linear_solve_s']:.3f}s | "
-        f"backend={record['backend_total_s']:.3f}s | "
-        f"mat={record['backend_matrix_rhs_update_s']:.3f}s | "
-        f"setup={record['backend_factorization_setup_s']:.3f}s | "
-        f"solve={record['backend_triangular_solve_s']:.3f}s | "
-        f"check={record['backend_true_residual_check_s']:.3f}s | "
-        f"postFlux={record['flow_post_flux_s']:.3f}s"
+        f"mom={record['flow_momentum_pass_s']:.3f}s | "
+        f"rowFill={record['flow_coo_value_fill_s']:.3f}s | "
+        f"mat={record['flow_coo_matrix_update_s']:.3f}s | "
+        f"MUMPS={record['flow_backend_factorization_s']:.3f}s | "
+        f"solve={record['flow_backend_solve_s']:.3f}s | "
+        f"gather={record['flow_backend_solution_gather_s']:.3f}s | "
+        f"postFlux={record['flow_post_flux_s']:.3f}s | "
+        f"energy={record['energy_total_s']:.3f}s"
     )
 
 
@@ -293,80 +305,46 @@ def _average(records: Iterable[Dict[str, float]], key: str) -> float:
     return sum(values) / len(values) if values else 0.0
 
 
-def summarize_timing(
-    records: List[Dict[str, float]],
-    timing_csv_path=None,
-) -> Dict[str, Any]:
+def summarize_timing(records: List[Dict[str, float]], timing_csv_path=None) -> Dict[str, Any]:
     if not records:
         return {}
-    return {
-        "avg_outer_total_s": _average(records, "outer_total_s"),
-        "avg_flow_total_s": _average(records, "flow_total_s"),
-        "avg_flow_assembly_total_s": _average(
-            records, "flow_assembly_total_s"
-        ),
-        "avg_flow_linear_solve_s": _average(
-            records, "flow_linear_solve_s"
-        ),
-        "avg_backend_total_s": _average(records, "backend_total_s"),
-        "avg_backend_matrix_rhs_update_s": _average(
-            records, "backend_matrix_rhs_update_s"
-        ),
-        "avg_backend_factorization_setup_s": _average(
-            records, "backend_factorization_setup_s"
-        ),
-        "avg_backend_triangular_solve_s": _average(
-            records, "backend_triangular_solve_s"
-        ),
-        "avg_backend_true_residual_check_s": _average(
-            records, "backend_true_residual_check_s"
-        ),
-        "avg_flow_post_flux_s": _average(records, "flow_post_flux_s"),
-        "timing_csv_path": (
-            str(timing_csv_path) if timing_csv_path is not None else None
-        ),
-    }
+    keys = [key for key in records[0] if key != "iteration"]
+    summary = {f"avg_{key}": _average(records, key) for key in keys}
+    summary["timing_csv_path"] = str(timing_csv_path) if timing_csv_path is not None else None
+    return summary
 
 
 def print_timing_summary(summary: Dict[str, Any]) -> None:
     if not summary:
         return
-    print("\n---------------- TIMING SUMMARY ----------------")
-    print(
-        f"    avg outer iteration       = {summary['avg_outer_total_s']:.4f} s"
+    print("\n---------------- MPI-MAX TIMING SUMMARY ----------------")
+    display = (
+        ("outer iteration", "avg_outer_total_s"),
+        ("flow total", "avg_flow_total_s"),
+        ("momentum pass", "avg_flow_momentum_pass_s"),
+        ("  pressure gradients", "avg_momentum_pressure_gradient_s"),
+        ("  pre-solve fluxes", "avg_momentum_pre_flux_s"),
+        ("  SOU gradients", "avg_momentum_sou_gradients_s"),
+        ("  momentum coefficients", "avg_momentum_coefficients_s"),
+        ("flow COO value fill", "avg_flow_coo_value_fill_s"),
+        ("flow COO matrix update", "avg_flow_coo_matrix_update_s"),
+        ("flow MUMPS factorization", "avg_flow_backend_factorization_s"),
+        ("flow MUMPS solve", "avg_flow_backend_solve_s"),
+        ("flow solution gather", "avg_flow_backend_solution_gather_s"),
+        ("flow post-flux", "avg_flow_post_flux_s"),
+        ("metrics", "avg_metrics_s"),
+        ("energy total", "avg_energy_total_s"),
+        ("  energy gradients", "avg_energy_gradient_s"),
+        ("  energy value fill", "avg_energy_value_fill_s"),
+        ("  energy COO update", "avg_energy_coo_matrix_update_s"),
+        ("  energy factorization", "avg_energy_backend_factorization_s"),
+        ("  energy solve", "avg_energy_backend_solve_s"),
     )
-    print(
-        f"    avg flow total            = {summary['avg_flow_total_s']:.4f} s"
-    )
-    print(
-        "    avg flow assembly total   = "
-        f"{summary['avg_flow_assembly_total_s']:.4f} s"
-    )
-    print(
-        "    avg flow linear solve     = "
-        f"{summary['avg_flow_linear_solve_s']:.4f} s"
-    )
-    print(
-        f"    avg PETSc backend total   = {summary['avg_backend_total_s']:.4f} s"
-    )
-    print(
-        "    avg PETSc matrix update   = "
-        f"{summary['avg_backend_matrix_rhs_update_s']:.4f} s"
-    )
-    print(
-        "    avg MUMPS factorization   = "
-        f"{summary['avg_backend_factorization_setup_s']:.4f} s"
-    )
-    print(
-        "    avg MUMPS solve           = "
-        f"{summary['avg_backend_triangular_solve_s']:.4f} s"
-    )
-    print(
-        "    avg true residual check   = "
-        f"{summary['avg_backend_true_residual_check_s']:.4f} s"
-    )
+    for label, key in display:
+        if key in summary:
+            print(f"    {label:<28s} = {summary[key]:.4f} s")
     if summary.get("timing_csv_path"):
-        print(f"    timing CSV                = {summary['timing_csv_path']}")
+        print(f"    timing CSV                  = {summary['timing_csv_path']}")
 
 
 def save_simulation_report(run_dir, filename, report_data):
@@ -394,6 +372,9 @@ Run setup:
     MPI ranks = {flags.get('mpi_ranks', 1)}
     threads per rank = {flags.get('threads_per_rank', 1)}
     direct solver = {flags.get('direct_solver', 'mumps')}
+    Numba kernels = {flags.get('use_numba', True)}
+    sparse update = fixed PETSc COO
+    profiling basis = MPI maximum rank time
 
 Grid:
     nx = {grid['nx']}

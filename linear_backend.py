@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Persistent PETSc/MUMPS direct solver for serial and MPI execution."""
+"""Persistent PETSc/MUMPS direct solver with fixed-pattern COO updates."""
 
 import hashlib
 import sys
@@ -41,9 +41,7 @@ DEFAULT_DIRECT_SOLVER_SETTINGS: Dict[str, Any] = {
 }
 
 
-def _deep_update(
-    base: Dict[str, Any], override: Optional[Dict[str, Any]]
-) -> Dict[str, Any]:
+def _deep_update(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     result: Dict[str, Any] = {}
     for key, value in base.items():
         result[key] = _deep_update(value, None) if isinstance(value, dict) else value
@@ -79,14 +77,12 @@ class _PetscDirectCache:
     global_size: int
     block_size: int
     pattern_signature: Any
+    row_start: int
+    row_end: int
+    fixed_coo: bool
 
 
-def _true_residual(
-    matrix,
-    rhs,
-    solution,
-    norm_type: str = "inf",
-) -> Tuple[float, float]:
+def _true_residual(matrix, rhs, solution, norm_type: str = "inf") -> Tuple[float, float]:
     matrix_csr = sparse.csr_matrix(matrix)
     rhs_array = np.asarray(rhs, dtype=float).reshape(-1)
     x = np.asarray(solution, dtype=float).reshape(-1)
@@ -94,11 +90,7 @@ def _true_residual(
 
     if str(norm_type).lower() in ("inf", "linf", "infinity"):
         absolute = float(np.max(np.abs(residual))) if residual.size else 0.0
-        rhs_norm = (
-            float(max(np.max(np.abs(rhs_array)), 1.0e-30))
-            if rhs_array.size
-            else 1.0
-        )
+        rhs_norm = float(max(np.max(np.abs(rhs_array)), 1.0e-30)) if rhs_array.size else 1.0
     else:
         absolute = float(np.linalg.norm(residual))
         rhs_norm = float(max(np.linalg.norm(rhs_array), 1.0e-30))
@@ -108,11 +100,8 @@ def _true_residual(
 class PetscDirectSolver:
     """Persistent sparse direct solver using PETSc LU and MUMPS.
 
-    With one MPI rank the solver uses ``PETSc.COMM_SELF`` and receives a global
-    CSR matrix. With multiple ranks it uses ``PETSc.COMM_WORLD``. Coupled flow
-    rows are then assembled locally by ``flow_assembly.py``; scalar systems such
-    as energy are currently assembled globally on every rank and only their
-    owned rows are inserted into PETSc.
+    Phase C uses MatSetPreallocationCOO once and MatSetValuesCOO on every
+    nonlinear iteration for both the coupled flow and scalar energy matrices.
     """
 
     supports_pressure_nullspace = False
@@ -127,7 +116,6 @@ class PetscDirectSolver:
     def _load_petsc():
         try:
             import petsc4py
-
             try:
                 petsc4py.init(sys.argv)
             except Exception:
@@ -157,7 +145,7 @@ class PetscDirectSolver:
         return self.PETSc.COMM_WORLD if self.size > 1 else self.PETSc.COMM_SELF
 
     def uses_local_flow_assembly(self) -> bool:
-        return self.size > 1
+        return True
 
     def barrier(self) -> None:
         self.PETSc.COMM_WORLD.barrier()
@@ -167,17 +155,43 @@ class PetscDirectSolver:
             return self.PETSc.COMM_WORLD.tompi4py().bcast(value, root=root)
         except Exception as exc:
             if self.size > 1:
-                raise RuntimeError(
-                    "mpi4py is required for MPI control-data broadcasts."
-                ) from exc
+                raise RuntimeError("mpi4py is required for MPI control-data broadcasts.") from exc
             return value
 
+    def allreduce_max(self, value: float) -> float:
+        """Return the slowest-rank timing value."""
+        if self.size == 1:
+            return float(value)
+        try:
+            from mpi4py import MPI
+            return float(
+                self.PETSc.COMM_WORLD.tompi4py().allreduce(float(value), op=MPI.MAX)
+            )
+        except Exception as exc:
+            raise RuntimeError("mpi4py is required for MPI max-reduced profiling.") from exc
+
+    def reduce_timing_max(self, timing):
+        """Recursively MPI-MAX reduce a timing dictionary.
+
+        Timing dictionaries are generated deterministically on every rank, so
+        all ranks traverse the same sorted key order.
+        """
+        if not isinstance(timing, dict):
+            return timing
+        reduced = {}
+        for key in sorted(timing):
+            value = timing[key]
+            if isinstance(value, dict):
+                reduced[key] = self.reduce_timing_max(value)
+            elif isinstance(value, (int, float, np.integer, np.floating)):
+                reduced[key] = self.allreduce_max(float(value))
+            else:
+                reduced[key] = value
+        return reduced
+
     def describe(self) -> str:
-        mode = "distributed local-row assembly" if self.size > 1 else "serial CSR assembly"
-        return (
-            f"PETSc direct LU ({self.config.get('solver_type', 'mumps')}, "
-            f"{mode})"
-        )
+        mode = "distributed fixed-COO assembly" if self.size > 1 else "serial fixed-COO assembly"
+        return f"PETSc direct LU ({self.config.get('solver_type', 'mumps')}, {mode})"
 
     def _system_options(self, system_type: str) -> Dict[str, Any]:
         common = {
@@ -221,27 +235,33 @@ class PetscDirectSolver:
         if global_size % block_size:
             quotient, remainder = divmod(global_size, size)
             return quotient + (1 if rank < remainder else 0)
-
         global_blocks = global_size // block_size
         quotient, remainder = divmod(global_blocks, size)
         local_blocks = quotient + (1 if rank < remainder else 0)
         return block_size * local_blocks
 
+    @classmethod
+    def _local_layout(cls, global_size: int, block_size: int, comm):
+        size = int(comm.getSize())
+        rank = int(comm.getRank())
+        local_sizes = []
+        for r in range(size):
+            class _RankProxy:
+                def getSize(self_nonlocal):
+                    return size
+                def getRank(self_nonlocal):
+                    return r
+            local_sizes.append(cls._local_size(global_size, block_size, _RankProxy()))
+        row_start = int(sum(local_sizes[:rank]))
+        local_size = int(local_sizes[rank])
+        return local_size, row_start, row_start + local_size
+
     def _set_factor_options(self, options: Dict[str, Any], prefix: str) -> None:
         self._set_option(f"{prefix}ksp_type", "preonly")
         self._set_option(f"{prefix}pc_type", "lu")
-        self._set_option(
-            f"{prefix}pc_factor_mat_solver_type",
-            options.get("solver_type", "mumps"),
-        )
-        self._set_option(
-            f"{prefix}pc_factor_reuse_ordering",
-            str(bool(options.get("reuse_ordering", True))).lower(),
-        )
-        self._set_option(
-            f"{prefix}pc_factor_reuse_fill",
-            str(bool(options.get("reuse_fill", True))).lower(),
-        )
+        self._set_option(f"{prefix}pc_factor_mat_solver_type", options.get("solver_type", "mumps"))
+        self._set_option(f"{prefix}pc_factor_reuse_ordering", str(bool(options.get("reuse_ordering", True))).lower())
+        self._set_option(f"{prefix}pc_factor_reuse_fill", str(bool(options.get("reuse_fill", True))).lower())
 
         ordering = options.get("ordering_type")
         if ordering not in (None, "", "auto"):
@@ -249,7 +269,6 @@ class PetscDirectSolver:
         fill = options.get("fill")
         if fill is not None:
             self._set_option(f"{prefix}pc_factor_fill", fill)
-
         for key, value in dict(options.get("mumps_icntl", {})).items():
             self._set_option(f"{prefix}mat_mumps_icntl_{int(key)}", value)
         for key, value in dict(options.get("mumps_cntl", {})).items():
@@ -265,17 +284,30 @@ class PetscDirectSolver:
         preallocation_nnz: int,
         options: Dict[str, Any],
         comm,
+        fixed_coo: bool,
+        coo_rows=None,
+        coo_cols=None,
     ) -> _PetscDirectCache:
         PETSc = self.PETSc
-        local_size = self._local_size(global_size, block_size, comm)
+        local_size, row_start, row_end = self._local_layout(global_size, block_size, comm)
 
         matrix = PETSc.Mat().create(comm=comm)
-        matrix.setSizes(
-            ((local_size, global_size), (local_size, global_size))
-        )
+        matrix.setSizes(((local_size, global_size), (local_size, global_size)))
         matrix.setType(PETSc.Mat.Type.AIJ)
         matrix.setBlockSize(int(block_size))
-        matrix.setPreallocationNNZ(max(int(preallocation_nnz), 1))
+
+        if fixed_coo:
+            if not hasattr(matrix, "setPreallocationCOO"):
+                raise RuntimeError(
+                    "This PETSc/petsc4py build does not provide Mat.setPreallocationCOO. "
+                    "PETSc 3.15 or newer is required for the Phase C fixed-COO path."
+                )
+            matrix.setPreallocationCOO(
+                np.asarray(coo_rows, dtype=PETSc.IntType).copy(),
+                np.asarray(coo_cols, dtype=PETSc.IntType).copy(),
+            )
+        else:
+            matrix.setPreallocationNNZ(max(int(preallocation_nnz), 1))
         matrix.setOption(PETSc.Mat.Option.KEEP_NONZERO_PATTERN, True)
         matrix.setUp()
 
@@ -291,9 +323,7 @@ class PetscDirectSolver:
         pc.setType("lu")
         pc.setFactorSolverType(str(options.get("solver_type", "mumps")))
         try:
-            pc.setFactorOrdering(
-                None, reuse=bool(options.get("reuse_ordering", True))
-            )
+            pc.setFactorOrdering(None, reuse=bool(options.get("reuse_ordering", True)))
         except Exception:
             pass
 
@@ -311,6 +341,9 @@ class PetscDirectSolver:
             global_size=int(global_size),
             block_size=int(block_size),
             pattern_signature=pattern_signature,
+            row_start=row_start,
+            row_end=row_end,
+            fixed_coo=bool(fixed_coo),
         )
 
     @staticmethod
@@ -322,31 +355,25 @@ class PetscDirectSolver:
                 pass
 
     def _get_cache(self, matrix_or_system, system_type: str, options, metadata):
-        is_local = bool(
-            getattr(matrix_or_system, "is_distributed_local", False)
-        )
-        if is_local:
+        is_fixed_coo = bool(getattr(matrix_or_system, "is_fixed_coo", False))
+        is_local_legacy = bool(getattr(matrix_or_system, "is_distributed_local", False)) and not is_fixed_coo
+        matrix_csr = None
+        coo_rows = coo_cols = None
+
+        if is_fixed_coo:
             global_size = int(matrix_or_system.global_size)
-            block_size = int(
-                getattr(
-                    matrix_or_system,
-                    "block_size",
-                    metadata.get("block_size", 1),
-                )
-            )
-            signature = getattr(
-                matrix_or_system,
-                "pattern_key",
-                (global_size, block_size, "local"),
-            )
-            preallocation = int(
-                getattr(
-                    matrix_or_system,
-                    "preallocation_nnz",
-                    options.get("preallocation_nnz", 20),
-                )
-            )
-            matrix_csr = None
+            block_size = int(getattr(matrix_or_system, "block_size", metadata.get("block_size", 1)))
+            signature = getattr(matrix_or_system, "pattern_key", (global_size, block_size, "coo"))
+            comm = self.comm
+            _local_size, row_start, row_end = self._local_layout(global_size, block_size, comm)
+            coo_rows, coo_cols = matrix_or_system.local_coo_pattern(row_start, row_end)
+            preallocation = max(int(options.get("preallocation_nnz", 1)), 1)
+        elif is_local_legacy:
+            global_size = int(matrix_or_system.global_size)
+            block_size = int(getattr(matrix_or_system, "block_size", metadata.get("block_size", 1)))
+            signature = getattr(matrix_or_system, "pattern_key", (global_size, block_size, "local"))
+            preallocation = int(getattr(matrix_or_system, "preallocation_nnz", options.get("preallocation_nnz", 20)))
+            comm = self.comm
         else:
             matrix_csr = self._as_csr(matrix_or_system)
             if matrix_csr.shape[0] != matrix_csr.shape[1]:
@@ -355,17 +382,10 @@ class PetscDirectSolver:
             block_size = int(metadata.get("block_size", 1))
             signature = self._pattern_signature(matrix_csr)
             row_nnz = np.diff(matrix_csr.indptr)
-            preallocation = int(
-                max(np.max(row_nnz) if row_nnz.size else 1, 1)
-            )
+            preallocation = int(max(np.max(row_nnz) if row_nnz.size else 1, 1))
+            comm = self.comm
 
-        comm = self.comm
-        key = (
-            system_type,
-            int(comm.getSize()),
-            global_size,
-            block_size,
-        )
+        key = (system_type, int(comm.getSize()), global_size, block_size)
         cache = self._caches.get(key)
         if cache is not None and cache.pattern_signature != signature:
             self._destroy_cache(cache)
@@ -381,21 +401,18 @@ class PetscDirectSolver:
                 preallocation_nnz=preallocation,
                 options=options,
                 comm=comm,
+                fixed_coo=is_fixed_coo,
+                coo_rows=coo_rows,
+                coo_cols=coo_cols,
             )
             self._caches[key] = cache
-        return cache, is_local, matrix_csr
+        return cache, is_fixed_coo, is_local_legacy, matrix_csr
 
-    def _fill_from_global_csr(
-        self,
-        cache: _PetscDirectCache,
-        matrix_csr: sparse.csr_matrix,
-        rhs_global,
-    ) -> None:
+    def _fill_from_global_csr(self, cache, matrix_csr, rhs_global) -> None:
         PETSc = self.PETSc
         matrix = cache.mat
         matrix.zeroEntries()
-        row_start, row_end = matrix.getOwnershipRange()
-
+        row_start, row_end = cache.row_start, cache.row_end
         for row in range(row_start, row_end):
             start = int(matrix_csr.indptr[row])
             end = int(matrix_csr.indptr[row + 1])
@@ -403,15 +420,10 @@ class PetscDirectSolver:
                 continue
             matrix.setValues(
                 np.asarray([row], dtype=PETSc.IntType),
-                np.asarray(
-                    matrix_csr.indices[start:end], dtype=PETSc.IntType
-                ),
-                np.asarray(
-                    matrix_csr.data[start:end], dtype=PETSc.ScalarType
-                ).reshape(1, -1),
+                np.asarray(matrix_csr.indices[start:end], dtype=PETSc.IntType),
+                np.asarray(matrix_csr.data[start:end], dtype=PETSc.ScalarType).reshape(1, -1),
             )
         matrix.assemble()
-
         rhs_array = cache.rhs.getArray()
         rhs_array[:] = np.asarray(rhs_global, dtype=float)[row_start:row_end]
         cache.rhs.assemble()
@@ -419,17 +431,31 @@ class PetscDirectSolver:
 
     def _gather_solution(self, vector, comm) -> np.ndarray:
         if int(comm.getSize()) == 1:
-            return np.asarray(
-                vector.getArray(readonly=True), dtype=float
-            ).copy()
+            return np.asarray(vector.getArray(readonly=True), dtype=float).copy()
         scatter, sequential = self.PETSc.Scatter.toAll(vector)
         scatter.scatter(vector, sequential)
-        result = np.asarray(
-            sequential.getArray(readonly=True), dtype=float
-        ).copy()
+        result = np.asarray(sequential.getArray(readonly=True), dtype=float).copy()
         scatter.destroy()
         sequential.destroy()
         return result
+
+    def _distributed_residual_metrics(self, mat, rhs_vec, solution_vec):
+        PETSc = self.PETSc
+        residual = rhs_vec.duplicate()
+        mat.mult(solution_vec, residual)
+        residual.aypx(-1.0, rhs_vec)
+        absolute = float(residual.norm(PETSc.NormType.NORM_INFINITY))
+        rhs_norm = max(float(rhs_vec.norm(PETSc.NormType.NORM_INFINITY)), 1.0e-30)
+        residual.destroy()
+        relative = absolute / rhs_norm
+        return {
+            "scaled_true_rel_residual": relative,
+            "scaled_true_abs_residual": absolute,
+            "unscaled_true_rel_residual": relative,
+            "unscaled_true_abs_residual": absolute,
+            "true_rel_residual": relative,
+            "true_abs_residual": absolute,
+        }
 
     def solve(
         self,
@@ -440,26 +466,34 @@ class PetscDirectSolver:
         metadata: Optional[Dict[str, Any]] = None,
         **_kwargs,
     ) -> np.ndarray:
-        del x0  # Direct LU always starts from an exact factorization solve.
+        del x0
         metadata = metadata or {}
         options = self._system_options(system_type)
         timing: Dict[str, float] = {}
         total_start = time.perf_counter()
 
-        cache, is_local, matrix_csr = self._get_cache(
+        cache, is_fixed_coo, is_local_legacy, matrix_csr = self._get_cache(
             matrix_or_system, system_type, options, metadata
         )
 
         update_start = time.perf_counter()
         local_stats: Dict[str, float] = {}
-        if is_local:
+        if is_fixed_coo:
             local_stats = dict(
-                matrix_or_system.assemble_petsc(cache.mat, cache.rhs)
+                matrix_or_system.assemble_petsc(
+                    cache.mat, cache.rhs, cache.row_start, cache.row_end
+                )
             )
+            cache.solution.set(0.0)
+        elif is_local_legacy:
+            local_stats = dict(matrix_or_system.assemble_petsc(cache.mat, cache.rhs))
             cache.solution.set(0.0)
         else:
             self._fill_from_global_csr(cache, matrix_csr, rhs)
         timing["matrix_rhs_update"] = time.perf_counter() - update_start
+        timing["coo_value_fill"] = float(local_stats.get("coo_value_fill", 0.0))
+        timing["coo_matrix_update"] = float(local_stats.get("coo_matrix_update", 0.0))
+        timing["coo_rhs_update"] = float(local_stats.get("coo_rhs_update", 0.0))
 
         ksp = cache.ksp
         pc = ksp.getPC()
@@ -486,62 +520,46 @@ class PetscDirectSolver:
         timing["solution_gather"] = time.perf_counter() - gather_start
 
         residual_start = time.perf_counter()
-        if is_local:
-            metrics = matrix_or_system.distributed_residual_metrics(
-                cache.mat, cache.rhs, cache.solution
-            )
+        if is_fixed_coo or is_local_legacy:
+            if hasattr(matrix_or_system, "distributed_residual_metrics"):
+                metrics = matrix_or_system.distributed_residual_metrics(
+                    cache.mat, cache.rhs, cache.solution
+                )
+            else:
+                metrics = self._distributed_residual_metrics(
+                    cache.mat, cache.rhs, cache.solution
+                )
         else:
             true_matrix = metadata.get("true_matrix", matrix_csr)
             true_rhs = metadata.get("true_rhs", rhs)
             scaled_rel, scaled_abs = _true_residual(
-                true_matrix,
-                true_rhs,
-                solution,
+                true_matrix, true_rhs, solution,
                 options.get("true_residual_norm", "inf"),
             )
-
             unscaled_rel = None
             unscaled_abs = None
             scaling = metadata.get("scaling")
             unscaled_matrix = metadata.get("unscaled_true_matrix")
             unscaled_rhs = metadata.get("unscaled_true_rhs")
-            if (
-                scaling is not None
-                and unscaled_matrix is not None
-                and unscaled_rhs is not None
-            ):
+            if scaling is not None and unscaled_matrix is not None and unscaled_rhs is not None:
                 physical_solution = scaling.unscale_solution(solution)
                 unscaled_rel, unscaled_abs = _true_residual(
-                    unscaled_matrix,
-                    unscaled_rhs,
-                    physical_solution,
+                    unscaled_matrix, unscaled_rhs, physical_solution,
                     options.get("true_residual_norm", "inf"),
                 )
-
             metrics = {
                 "scaled_true_rel_residual": scaled_rel,
                 "scaled_true_abs_residual": scaled_abs,
                 "unscaled_true_rel_residual": unscaled_rel,
                 "unscaled_true_abs_residual": unscaled_abs,
-                "true_rel_residual": max(
-                    scaled_rel,
-                    unscaled_rel if unscaled_rel is not None else scaled_rel,
-                ),
-                "true_abs_residual": max(
-                    scaled_abs,
-                    unscaled_abs if unscaled_abs is not None else scaled_abs,
-                ),
+                "true_rel_residual": max(scaled_rel, unscaled_rel if unscaled_rel is not None else scaled_rel),
+                "true_abs_residual": max(scaled_abs, unscaled_abs if unscaled_abs is not None else scaled_abs),
             }
         timing["true_residual_check"] = time.perf_counter() - residual_start
 
         tolerance = float(options.get("true_residual_tolerance", 1.0e-5))
         true_ok = float(metrics["true_rel_residual"]) <= tolerance
-        converged = (
-            reason > 0
-            and pc_failed == 0
-            and true_ok
-            and np.all(np.isfinite(solution))
-        )
+        converged = reason > 0 and pc_failed == 0 and true_ok and np.all(np.isfinite(solution))
 
         factor_solver = str(options.get("solver_type", "mumps"))
         factor_nnz = None
@@ -550,11 +568,7 @@ class PetscDirectSolver:
             factor_solver = str(pc.getFactorSolverType())
             factor = pc.getFactorMatrix()
             factor_info = factor.getInfo()
-            factor_nnz = float(
-                factor_info.get(
-                    "nz_used", factor_info.get("nz_allocated", 0.0)
-                )
-            )
+            factor_nnz = float(factor_info.get("nz_used", factor_info.get("nz_allocated", 0.0)))
             factor_memory = float(factor_info.get("memory", 0.0))
         except Exception:
             pass
@@ -566,17 +580,14 @@ class PetscDirectSolver:
             reason=reason,
             iterations=iterations,
             residual_norm=petsc_residual,
-            message=(
-                "PETSc direct LU completed."
-                if converged
-                else "PETSc direct LU failed."
-            ),
+            message="PETSc direct LU completed." if converged else "PETSc direct LU failed.",
             extra={
                 "strategy": "direct_lu",
                 "direct_solver_type": factor_solver,
                 "mpi_size": int(cache.comm.getSize()),
                 "persistent": True,
-                "local_assembly": is_local,
+                "fixed_coo": is_fixed_coo,
+                "local_assembly": is_fixed_coo or is_local_legacy,
                 "factor_nnz": factor_nnz,
                 "factor_memory": factor_memory,
                 "pc_failed_reason": pc_failed,
@@ -588,13 +599,8 @@ class PetscDirectSolver:
             },
         )
 
-        if (
-            int(cache.comm.getRank()) == 0
-            and bool(
-                options.get(
-                    "print_diagnostics", self.config.get("verbose", True)
-                )
-            )
+        if int(cache.comm.getRank()) == 0 and bool(
+            options.get("print_diagnostics", self.config.get("verbose", True))
         ):
             unscaled_value = metrics.get("unscaled_true_rel_residual")
             print(
@@ -603,18 +609,14 @@ class PetscDirectSolver:
                 f"reason={reason} | pcFailed={pc_failed} | "
                 f"scaledTrueRel={float(metrics['scaled_true_rel_residual']):.3e} | "
                 f"unscaledTrueRel={float(unscaled_value) if unscaled_value is not None else float('nan'):.3e} | "
-                f"allowed={tolerance:.3e} | persistent=True | "
-                f"localAssembly={is_local}"
+                f"allowed={tolerance:.3e} | persistent=True | fixedCOO={is_fixed_coo}"
             )
 
-        if not converged and bool(
-            self.config.get("error_on_nonconvergence", True)
-        ):
+        if not converged and bool(self.config.get("error_on_nonconvergence", True)):
             raise RuntimeError(
                 "PETSc direct LU failed: "
-                f"solver={factor_solver}, reason={reason}, "
-                f"pc_failed={pc_failed}, true relative residual="
-                f"{float(metrics['true_rel_residual']):.6e}, "
+                f"solver={factor_solver}, reason={reason}, pc_failed={pc_failed}, "
+                f"true relative residual={float(metrics['true_rel_residual']):.6e}, "
                 f"allowed={tolerance:.6e}."
             )
         return solution
@@ -625,8 +627,5 @@ class PetscDirectSolver:
         self._caches.clear()
 
 
-def create_linear_solver(
-    config: Optional[Dict[str, Any]] = None,
-) -> PetscDirectSolver:
-    """Create the only production linear solver: persistent PETSc/MUMPS LU."""
+def create_linear_solver(config: Optional[Dict[str, Any]] = None) -> PetscDirectSolver:
     return PetscDirectSolver(config)
