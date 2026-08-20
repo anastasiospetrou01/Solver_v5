@@ -288,6 +288,10 @@ The solver has been regression-tested on canonical laminar CFD cases, including 
 | Tmax | `29.991105 °C` |
 | Relative energy-balance error | `~6.6 × 10⁻¹⁴` |
 
+<img width="2400" height="1350" alt="temperature" src="https://github.com/user-attachments/assets/8f5b4a40-60d3-4402-bb6b-57bff5c3744d" />
+
+Ra = 5.34 * 10^8
+
 ### Average MPI-max timing
 
 ```text
