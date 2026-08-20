@@ -1,8 +1,6 @@
-# ============================================================
-# COUPLED FLOW AND ENERGY EQUATIONS — PHASE A/B/C OPTIMIZED
-# ============================================================
-
 from __future__ import annotations
+
+"""Coupled flow and energy equations with distributed Phase D/F data ownership."""
 
 from dataclasses import dataclass
 import time
@@ -11,11 +9,11 @@ from typing import Any, Dict
 import numpy as np
 
 from flow_assembly import (
-    FixedCSRPattern,
+    LocalCOOPattern,
     assemble_flow_correction_system,
 )
 from numerical_kernels import (
-    fill_energy_csr_kernel,
+    fill_energy_local_coo_kernel,
     update_flow_fields_kernel,
 )
 from solver_utils import (
@@ -36,7 +34,6 @@ def solve_pressure_velocity(
     linear_solver=None,
     old_fields=None,
 ):
-    """Solve one nonlinear iteration of the fully coupled direct-LU system."""
     if transient is not None:
         raise NotImplementedError(
             "Transient pressure-velocity terms are reserved for the transient solver."
@@ -46,7 +43,6 @@ def solve_pressure_velocity(
 
     timing_enabled = bool(settings.get("profiling", {}).get("enabled", False))
     total_start = time.perf_counter()
-
     if old_fields is None:
         old_fields = snapshot_fields(ctx, fields)
 
@@ -55,12 +51,13 @@ def solve_pressure_velocity(
         settings,
         fields,
         coeffs,
+        old_fields=old_fields,
         distributed=True,
     )
     timing = dict(system.assembly_timing)
 
     linear_start = time.perf_counter()
-    scaled_correction = linear_solver.solve(
+    scaled_local_correction = linear_solver.solve(
         system,
         None,
         system_type="flow_coupled",
@@ -68,10 +65,10 @@ def solve_pressure_velocity(
     )
     timing["flow_linear_solve"] = time.perf_counter() - linear_start
 
-    if not np.all(np.isfinite(scaled_correction)):
+    if not np.all(np.isfinite(scaled_local_correction)):
         raise RuntimeError("The direct linear solver returned non-finite corrections.")
+    correction = system.recover_correction(scaled_local_correction)
 
-    correction = system.recover_correction(scaled_correction)
     backend_info = linear_solver.last_info
     backend_extra = backend_info.extra if backend_info is not None else {}
     true_rel = float(backend_extra.get("unscaled_true_rel_residual", np.inf))
@@ -86,7 +83,7 @@ def solve_pressure_velocity(
             f"true relative infinity residual={true_rel:.6e}, allowed={allowed:.6e}."
         )
 
-    update_start = time.perf_counter()
+    stage = time.perf_counter()
     topology = ctx["topology"]
     update_flow_fields_kernel(
         topology["fluid_i"],
@@ -102,42 +99,45 @@ def solve_pressure_velocity(
         fields["v"],
         fields["p"],
     )
+    # Solids in owned and ghost rows remain exactly zero for flow variables.
     fields["u"][ctx["is_solid"]] = 0.0
     fields["v"][ctx["is_solid"]] = 0.0
     fields["p"][ctx["is_solid"]] = 0.0
 
     if system.pressure_constraint_mode == "pin":
-        pressure_cfg = settings.get("pressure_reference", {})
-        i_ref = int(pressure_cfg.get("i", ctx.get("p_ref_i", 0)))
-        j_ref = int(pressure_cfg.get("j", ctx.get("p_ref_j", 0)))
-        if (
-            0 <= i_ref < ctx["nx"]
-            and 0 <= j_ref < ctx["ny"]
-            and ctx["is_fluid"][j_ref, i_ref]
-        ):
-            fields["p"][j_ref, i_ref] = float(pressure_cfg.get("value", 0.0))
-    timing["flow_field_update"] = time.perf_counter() - update_start
+        i_ref = int(ctx["p_ref_i"])
+        j_ref = int(ctx["p_ref_j"])
+        if ctx["domain"].owns_global_j(j_ref):
+            jl = ctx["domain"].global_to_local_j(j_ref)
+            if ctx["is_fluid"][jl, i_ref]:
+                fields["p"][jl, i_ref] = float(
+                    settings.get("pressure_reference", {}).get("value", 0.0)
+                )
+    timing["flow_field_update"] = time.perf_counter() - stage
 
-    coefficient_start = time.perf_counter()
-    # Keep lagged coefficient arrays persistent and overwrite them in-place.
+    stage = time.perf_counter()
+    ctx["domain"].exchange_many((fields["u"], fields["v"], fields["p"]))
+    timing["flow_field_halo"] = time.perf_counter() - stage
+
+    stage = time.perf_counter()
     np.copyto(coeffs["aPu"], system.momentum.aPu)
     np.copyto(coeffs["aPv"], system.momentum.aPv)
-    timing["flow_coeff_update"] = time.perf_counter() - coefficient_start
+    # momentum.aPu/aPv already contain current neighbour halos after assembly.
+    timing["flow_coeff_update"] = time.perf_counter() - stage
 
-    flux_start = time.perf_counter()
+    stage = time.perf_counter()
     dpdx, dpdy = compute_pressure_gradients(ctx, fields["p"])
     gradients = {"dpdx": dpdx, "dpdy": dpdy}
     fluxes = compute_face_fluxes(ctx, settings, fields, coeffs, gradients)
-    timing["flow_post_flux"] = time.perf_counter() - flux_start
+    timing["flow_post_flux"] = time.perf_counter() - stage
 
+    owned = ctx["domain"].owned_slice
     if not (
-        np.all(np.isfinite(fields["u"]))
-        and np.all(np.isfinite(fields["v"]))
-        and np.all(np.isfinite(fields["p"]))
-        and np.all(np.isfinite(fluxes["me"]))
-        and np.all(np.isfinite(fluxes["mn"]))
+        np.all(np.isfinite(fields["u"][owned, :]))
+        and np.all(np.isfinite(fields["v"][owned, :]))
+        and np.all(np.isfinite(fields["p"][owned, :]))
     ):
-        raise RuntimeError("Non-finite flow fields or face fluxes were generated.")
+        raise RuntimeError("Non-finite distributed flow fields were generated.")
 
     fluxes["dpdx"] = dpdx
     fluxes["dpdy"] = dpdy
@@ -167,40 +167,50 @@ def solve_pressure_velocity(
 
 
 # ============================================================
-# ENERGY EQUATION — FIXED FIVE-POINT COO PATTERN
+# ENERGY — PETSc-OWNED ROWS ONLY (PHASE D)
 # ============================================================
 
 
-def build_energy_pattern(ctx) -> FixedCSRPattern:
+def build_energy_pattern(ctx) -> LocalCOOPattern:
     existing = ctx.get("energy_pattern")
     if existing is not None:
         return existing
 
-    nx = int(ctx["nx"])
-    ny = int(ctx["ny"])
-    neighbor = ctx["topology"]["cell_neighbor"]
-    ncell = nx * ny
+    topology = ctx["topology"]
+    neighbor = topology["energy_neighbor_gid"]
+    gids = topology["energy_global_gid"]
+    row_start = int(ctx["domain"].energy_row_start)
+    row_end = int(ctx["domain"].energy_row_end)
+
     indptr = [0]
-    indices = []
-
-    for cell in range(ncell):
-        cols = [cell]
+    cols = []
+    for lc, gid in enumerate(gids):
+        row_cols = [int(gid)]
         for direction in range(4):
-            nb = int(neighbor[cell, direction])
+            nb = int(neighbor[lc, direction])
             if nb >= 0:
-                cols.append(nb)
-        indices.extend(cols)
-        indptr.append(len(indices))
+                row_cols.append(nb)
+        cols.extend(row_cols)
+        indptr.append(len(cols))
 
-    pattern = FixedCSRPattern(
-        indptr=np.asarray(indptr, dtype=np.int64),
-        indices=np.asarray(indices, dtype=np.int64),
+    local_indptr = np.asarray(indptr, dtype=np.int64)
+    cols_array = np.asarray(cols, dtype=np.int64)
+    counts = np.diff(local_indptr)
+    rows = np.repeat(np.arange(row_start, row_end, dtype=np.int64), counts)
+    pattern = LocalCOOPattern(
+        local_indptr=local_indptr,
+        rows=rows,
+        cols=cols_array,
+        row_start=row_start,
+        row_end=row_end,
         pattern_key=(
-            "v5_phase_abc_energy_coo",
-            nx,
-            ny,
-            ncell,
-            len(indices),
+            "v5_phase_df_energy_local_coo",
+            int(ctx["nx"]),
+            int(ctx["ny"]),
+            int(ctx["domain"].size),
+            row_start,
+            row_end,
+            int(cols_array.size),
         ),
     )
     ctx["energy_pattern"] = pattern
@@ -210,17 +220,30 @@ def build_energy_pattern(ctx) -> FixedCSRPattern:
 @dataclass
 class EnergyCOOLinearSystem:
     ctx: Dict[str, Any]
-    pattern: FixedCSRPattern
+    pattern: LocalCOOPattern
     data: np.ndarray
-    rhs_global: np.ndarray
+    rhs_local: np.ndarray
 
     is_fixed_coo: bool = True
-    is_distributed_local: bool = False
+    is_distributed_local: bool = True
+    returns_local_solution: bool = True
     block_size: int = 1
 
     @property
     def global_size(self) -> int:
-        return int(self.rhs_global.size)
+        return int(self.ctx["nx"]) * int(self.ctx["ny"])
+
+    @property
+    def local_size(self) -> int:
+        return int(self.pattern.row_end - self.pattern.row_start)
+
+    @property
+    def row_start(self) -> int:
+        return int(self.pattern.row_start)
+
+    @property
+    def row_end(self) -> int:
+        return int(self.pattern.row_end)
 
     @property
     def pattern_key(self):
@@ -231,56 +254,56 @@ class EnergyCOOLinearSystem:
         return {
             "block_size": 1,
             "fixed_coo": True,
+            "distributed_energy_assembly": True,
+            "returns_local_solution": True,
             "pattern_key": self.pattern_key,
         }
 
-    def local_coo_pattern(self, row_start: int, row_end: int):
-        rows, cols, _nz0, _nz1 = self.pattern.local_coo(row_start, row_end)
-        return rows, cols
+    def local_coo_pattern(self, *_args):
+        return self.pattern.rows, self.pattern.cols
 
     def assemble_petsc(self, mat, rhs_vec, row_start: int, row_end: int):
         from petsc4py import PETSc
 
-        _rows, _cols, nz_start, nz_end = self.pattern.local_coo(
-            row_start, row_end
-        )
+        if int(row_start) != self.row_start or int(row_end) != self.row_end:
+            raise RuntimeError(
+                "PETSc energy ownership does not match the structured y-slab: "
+                f"PETSc={row_start}:{row_end}, expected={self.row_start}:{self.row_end}."
+            )
         stage = time.perf_counter()
         mat.setValuesCOO(
-            np.asarray(self.data[nz_start:nz_end], dtype=PETSc.ScalarType),
+            np.asarray(self.data, dtype=PETSc.ScalarType),
             addv=PETSc.InsertMode.INSERT_VALUES,
         )
-        coo_matrix = time.perf_counter() - stage
+        matrix_time = time.perf_counter() - stage
 
         stage = time.perf_counter()
         rhs_array = rhs_vec.getArray()
-        rhs_array[:] = np.asarray(
-            self.rhs_global[row_start:row_end], dtype=rhs_array.dtype
-        )
+        rhs_array[:] = np.asarray(self.rhs_local, dtype=rhs_array.dtype)
         rhs_vec.assemble()
-        rhs_update = time.perf_counter() - stage
+        rhs_time = time.perf_counter() - stage
         return {
-            "local_rows": float(row_end - row_start),
+            "local_rows": float(self.local_size),
             "coo_value_fill": 0.0,
-            "coo_matrix_update": coo_matrix,
-            "coo_rhs_update": rhs_update,
+            "coo_matrix_update": matrix_time,
+            "coo_rhs_update": rhs_time,
         }
 
 
 def assemble_energy_fixed_system(ctx, settings, fields, fluxes):
-    """Fill the fixed energy matrix numerical values without SciPy LIL/COO rebuilds."""
     timing: Dict[str, float] = {}
     pattern = build_energy_pattern(ctx)
     workspace = initialize_solver_workspace(ctx)
 
-    data = workspace.get("energy_matrix_data")
+    data = workspace.get("energy_local_matrix_data")
     if data is None or data.size != pattern.nnz:
         data = np.empty(pattern.nnz, dtype=float)
-        workspace["energy_matrix_data"] = data
-    rhs = workspace.get("energy_rhs")
-    ncell = int(ctx["nx"]) * int(ctx["ny"])
-    if rhs is None or rhs.size != ncell:
-        rhs = np.empty(ncell, dtype=float)
-        workspace["energy_rhs"] = rhs
+        workspace["energy_local_matrix_data"] = data
+    rhs = workspace.get("energy_local_rhs")
+    local_size = int(ctx["domain"].local_energy_size)
+    if rhs is None or rhs.size != local_size:
+        rhs = np.empty(local_size, dtype=float)
+        workspace["energy_local_rhs"] = rhs
 
     energy_scheme = str(settings["schemes"].get("energy", "upwind")).lower()
     sou_enabled = (
@@ -299,12 +322,13 @@ def assemble_energy_fixed_system(ctx, settings, fields, fluxes):
     timing["energy_gradient"] = time.perf_counter() - stage
 
     stage = time.perf_counter()
-    fill_energy_csr_kernel(
+    fill_energy_local_coo_kernel(
         int(ctx["nx"]),
-        int(ctx["ny"]),
-        pattern.indptr,
-        ctx["topology"]["cell_face_kind"],
-        ctx["topology"]["cell_neighbor"],
+        int(ctx["domain"].owned_ny),
+        int(ctx["domain"].halo),
+        pattern.local_indptr,
+        ctx["topology"]["energy_face_kind"],
+        ctx["topology"]["energy_neighbor_gid"],
         ctx["topology"]["heat_bc_code"],
         ctx["topology"]["heat_bc_T"],
         ctx["topology"]["heat_bc_q"],
@@ -334,9 +358,7 @@ def assemble_energy_fixed_system(ctx, settings, fields, fluxes):
 
 def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=None):
     if transient is not None:
-        raise NotImplementedError(
-            "Transient energy term is reserved for the transient solver."
-        )
+        raise NotImplementedError("Transient energy term is reserved for the transient solver.")
     if linear_solver is None:
         raise ValueError("A PetscDirectSolver instance is required for the energy solve.")
 
@@ -350,50 +372,36 @@ def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=No
     timing.update(assembly_timing)
 
     stage = time.perf_counter()
-    T_vec = linear_solver.solve(
+    T_owned_vec = linear_solver.solve(
         system,
         None,
         system_type="energy",
-        x0=fields["T"].reshape(-1),
         metadata=system.metadata,
     )
     timing["energy_linear_solve"] = time.perf_counter() - stage
-
-    if not np.all(np.isfinite(T_vec)):
+    if not np.all(np.isfinite(T_owned_vec)):
         raise RuntimeError("Energy linear solve produced non-finite values.")
 
     stage = time.perf_counter()
-    T_old = fields["T"]
-    T_new = T_vec.reshape((int(ctx["ny"]), int(ctx["nx"])))
-    alpha_T = float(settings["relaxation"]["T"])
-    workspace = initialize_solver_workspace(ctx)
-    relaxed = workspace.get("energy_relaxed")
-    if relaxed is None or relaxed.shape != T_old.shape:
-        relaxed = np.empty_like(T_old)
-        workspace["energy_relaxed"] = relaxed
-    np.add(
-        alpha_T * T_new,
-        (1.0 - alpha_T) * T_old,
-        out=relaxed,
+    owned = ctx["domain"].owned_slice
+    T_owned = fields["T"][owned, :]
+    T_new = np.asarray(T_owned_vec, dtype=float).reshape(
+        (ctx["domain"].owned_ny, int(ctx["nx"]))
     )
+    alpha_T = float(settings["relaxation"]["T"])
+    T_owned[:] = alpha_T * T_new + (1.0 - alpha_T) * T_owned
     timing["energy_field_update"] = time.perf_counter() - stage
 
+    stage = time.perf_counter()
+    ctx["domain"].exchange_halo(fields["T"])
+    timing["energy_field_halo"] = time.perf_counter() - stage
+
     backend_info = getattr(linear_solver, "last_info", None)
-    backend_extra = (
-        getattr(backend_info, "extra", {}) if backend_info is not None else {}
-    )
-    backend_timing = (
-        backend_extra.get("timing", {})
-        if isinstance(backend_extra, dict)
-        else {}
-    )
+    backend_extra = getattr(backend_info, "extra", {}) if backend_info is not None else {}
+    backend_timing = backend_extra.get("timing", {}) if isinstance(backend_extra, dict) else {}
     if backend_timing:
         timing["backend"] = dict(backend_timing)
-    local_stats = (
-        backend_extra.get("local_assembly_stats", {})
-        if isinstance(backend_extra, dict)
-        else {}
-    )
+    local_stats = backend_extra.get("local_assembly_stats", {}) if isinstance(backend_extra, dict) else {}
     if isinstance(local_stats, dict):
         for key in ("coo_value_fill", "coo_matrix_update", "coo_rhs_update"):
             if key in local_stats:
@@ -402,11 +410,11 @@ def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=No
     timing["energy_total"] = time.perf_counter() - total_start
     if timing_enabled:
         settings["_last_energy_timing"] = timing
-    return relaxed
+    return fields["T"]
 
 
 # ============================================================
-# ENERGY BALANCE CONDUCTANCE HELPERS — retained for reporting
+# ENERGY BALANCE CONDUCTANCE HELPERS — final root reporting only
 # ============================================================
 
 from solver_utils import (

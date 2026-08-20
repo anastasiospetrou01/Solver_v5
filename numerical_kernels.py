@@ -1487,3 +1487,738 @@ def fill_energy_csr_kernel(
                 data[pos] = -aS
                 pos += 1
             rhs[P] = Su
+# ============================================================
+# PHASE D/F DISTRIBUTED LOCAL-ASSEMBLY KERNELS
+# ============================================================
+
+@njit(cache=True, fastmath=False)
+def _right_scale_from_col(col: int, velocity_scale: float, pressure_scale: float) -> float:
+    if col % 3 == 2:
+        return pressure_scale
+    return velocity_scale
+
+
+@njit(cache=True, fastmath=False)
+def _store_scaled_value_distributed(
+    data: np.ndarray,
+    pos: int,
+    col: int,
+    value: float,
+    left_scale: float,
+    velocity_scale: float,
+    pressure_scale: float,
+) -> None:
+    data[pos] = (
+        left_scale
+        * value
+        * _right_scale_from_col(col, velocity_scale, pressure_scale)
+    )
+
+
+@njit(cache=True, fastmath=False)
+def fill_flow_local_coo_distributed_kernel(
+    fid_start: int,
+    local_indptr: np.ndarray,
+    fluid_i: np.ndarray,
+    fluid_j: np.ndarray,
+    neighbor_fid: np.ndarray,
+    face_kind: np.ndarray,
+    flow_bc_code: np.ndarray,
+    flow_bc_u: np.ndarray,
+    flow_bc_v: np.ndarray,
+    flow_bc_p: np.ndarray,
+    rho: np.ndarray,
+    beta: np.ndarray,
+    sx: np.ndarray,
+    sy: np.ndarray,
+    temperature: np.ndarray,
+    u_old: np.ndarray,
+    v_old: np.ndarray,
+    p_old: np.ndarray,
+    aE: np.ndarray,
+    aW: np.ndarray,
+    aN: np.ndarray,
+    aS: np.ndarray,
+    aPu: np.ndarray,
+    aPv: np.ndarray,
+    source_u: np.ndarray,
+    source_v: np.ndarray,
+    dpdx: np.ndarray,
+    dpdy: np.ndarray,
+    momentum_left_scale: float,
+    continuity_left_scale: float,
+    velocity_right_scale: float,
+    pressure_right_scale: float,
+    dx: float,
+    dy: float,
+    volume: float,
+    t_ref: float,
+    gy: float,
+    buoyancy_enabled: bool,
+    pressure_reference_row: int,
+    pressure_reference_value: float,
+    local_data: np.ndarray,
+    local_rhs: np.ndarray,
+) -> None:
+    """Fill only this rank's contiguous [u,v,p] rows.
+
+    All CFD fields are local arrays with ghost rows.  Global compact fluid IDs
+    are used only for matrix column numbers; no global state vector is needed.
+    """
+    local_data.fill(0.0)
+    local_rhs.fill(0.0)
+
+    nlocal = fluid_i.size
+    for lfid in range(nlocal):
+        fid = fid_start + lfid
+        i = int(fluid_i[lfid])
+        j = int(fluid_j[lfid])
+        nb_e = int(neighbor_fid[lfid, EAST])
+        nb_w = int(neighbor_fid[lfid, WEST])
+        nb_n = int(neighbor_fid[lfid, NORTH])
+        nb_s = int(neighbor_fid[lfid, SOUTH])
+        kind_e = int(face_kind[lfid, EAST])
+        kind_w = int(face_kind[lfid, WEST])
+        kind_n = int(face_kind[lfid, NORTH])
+        kind_s = int(face_kind[lfid, SOUTH])
+
+        ru = 3 * fid
+        rv = ru + 1
+        rp = ru + 2
+        lru = 3 * lfid
+        lrv = lru + 1
+        lrp = lru + 2
+        px = volume / dx
+        py = volume / dy
+
+        ae = aE[j, i]
+        aw = aW[j, i]
+        an = aN[j, i]
+        a_s = aS[j, i]
+        ap_u = aPu[j, i]
+        ap_v = aPv[j, i]
+
+        # ---------------- u momentum row ----------------
+        pos = int(local_indptr[lru])
+        ax_old = 0.0
+        rhs_abs = source_u[j, i] + sx[j, i] * volume
+
+        col = ru
+        value = ap_u
+        _store_scaled_value_distributed(
+            local_data, pos, col, value, momentum_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += value * u_old[j, i]
+        pos += 1
+
+        if nb_e >= 0:
+            col = 3 * nb_e
+            value = -ae
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j, i + 1]
+            pos += 1
+        if nb_w >= 0:
+            col = 3 * nb_w
+            value = -aw
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j, i - 1]
+            pos += 1
+        if nb_n >= 0:
+            col = 3 * nb_n
+            value = -an
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j + 1, i]
+            pos += 1
+        if nb_s >= 0:
+            col = 3 * nb_s
+            value = -a_s
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j - 1, i]
+            pos += 1
+
+        self_p = 0.0
+        if kind_e == FACE_FLUID_FLUID:
+            self_p += 0.5 * px
+        elif kind_e == FACE_BOUNDARY and int(flow_bc_code[EAST]) == FLOW_BC_OPEN:
+            rhs_abs -= px * flow_bc_p[EAST]
+        else:
+            self_p += px
+
+        if kind_w == FACE_FLUID_FLUID:
+            self_p -= 0.5 * px
+        elif kind_w == FACE_BOUNDARY and int(flow_bc_code[WEST]) == FLOW_BC_OPEN:
+            rhs_abs += px * flow_bc_p[WEST]
+        else:
+            self_p -= px
+
+        col = rp
+        _store_scaled_value_distributed(
+            local_data, pos, col, self_p, momentum_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += self_p * p_old[j, i]
+        pos += 1
+
+        if nb_e >= 0:
+            col = 3 * nb_e + 2
+            value = 0.5 * px
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j, i + 1]
+            pos += 1
+        if nb_w >= 0:
+            col = 3 * nb_w + 2
+            value = -0.5 * px
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j, i - 1]
+            pos += 1
+
+        local_rhs[lru] = momentum_left_scale * (rhs_abs - ax_old)
+
+        # ---------------- v momentum row ----------------
+        pos = int(local_indptr[lrv])
+        ax_old = 0.0
+        rhs_abs = (
+            source_v[j, i]
+            + sy[j, i] * volume
+            + _body_force_y(
+                rho[j, i], beta[j, i], temperature[j, i],
+                t_ref, gy, buoyancy_enabled
+            ) * volume
+        )
+
+        col = rv
+        value = ap_v
+        _store_scaled_value_distributed(
+            local_data, pos, col, value, momentum_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += value * v_old[j, i]
+        pos += 1
+
+        if nb_e >= 0:
+            col = 3 * nb_e + 1
+            value = -ae
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j, i + 1]
+            pos += 1
+        if nb_w >= 0:
+            col = 3 * nb_w + 1
+            value = -aw
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j, i - 1]
+            pos += 1
+        if nb_n >= 0:
+            col = 3 * nb_n + 1
+            value = -an
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j + 1, i]
+            pos += 1
+        if nb_s >= 0:
+            col = 3 * nb_s + 1
+            value = -a_s
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j - 1, i]
+            pos += 1
+
+        self_p = 0.0
+        if kind_n == FACE_FLUID_FLUID:
+            self_p += 0.5 * py
+        elif kind_n == FACE_BOUNDARY and int(flow_bc_code[NORTH]) == FLOW_BC_OPEN:
+            rhs_abs -= py * flow_bc_p[NORTH]
+        else:
+            self_p += py
+
+        if kind_s == FACE_FLUID_FLUID:
+            self_p -= 0.5 * py
+        elif kind_s == FACE_BOUNDARY and int(flow_bc_code[SOUTH]) == FLOW_BC_OPEN:
+            rhs_abs += py * flow_bc_p[SOUTH]
+        else:
+            self_p -= py
+
+        col = rp
+        _store_scaled_value_distributed(
+            local_data, pos, col, self_p, momentum_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += self_p * p_old[j, i]
+        pos += 1
+
+        if nb_n >= 0:
+            col = 3 * nb_n + 2
+            value = 0.5 * py
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j + 1, i]
+            pos += 1
+        if nb_s >= 0:
+            col = 3 * nb_s + 2
+            value = -0.5 * py
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, momentum_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j - 1, i]
+            pos += 1
+
+        local_rhs[lrv] = momentum_left_scale * (rhs_abs - ax_old)
+
+        # ---------------- continuity row ----------------
+        pos = int(local_indptr[lrp])
+        if rp == pressure_reference_row:
+            col = rp
+            value = 1.0
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old = p_old[j, i]
+            pos += 1
+            row_end = int(local_indptr[lrp + 1])
+            while pos < row_end:
+                local_data[pos] = 0.0
+                pos += 1
+            local_rhs[lrp] = continuity_left_scale * (
+                pressure_reference_value - ax_old
+            )
+            continue
+
+        self_p = 0.0
+        self_u = 0.0
+        self_v = 0.0
+        e_u = e_p = 0.0
+        w_u = w_p = 0.0
+        n_v = n_p = 0.0
+        s_v = s_p = 0.0
+        rhs_abs = 0.0
+
+        dpe_interp = 0.0
+        dpw_interp = 0.0
+        dpn_interp = 0.0
+        dps_interp = 0.0
+        byn_corr = 0.0
+        bys_corr = 0.0
+
+        if kind_e == FACE_FLUID_FLUID:
+            dP = volume / max(aPu[j, i], _EPS)
+            dE = volume / max(aPu[j, i + 1], _EPS)
+            de = 0.5 * (dP + dE)
+            rho_e = 0.5 * (rho[j, i] + rho[j, i + 1])
+            aEc = rho_e * dy * de / dx
+            dpe_interp = rho_e * dy * de * 0.5 * (dpdx[j, i] + dpdx[j, i + 1])
+            self_p += aEc
+            self_u += rho_e * dy / 2.0
+            e_u = rho_e * dy / 2.0
+            e_p = -aEc
+        elif kind_e == FACE_BOUNDARY:
+            code = int(flow_bc_code[EAST])
+            rhoP = rho[j, i]
+            if code == FLOW_BC_OUTLET:
+                self_u += rhoP * dy
+            elif code == FLOW_BC_INLET:
+                rhs_abs += -rhoP * dy * flow_bc_u[EAST]
+            elif code == FLOW_BC_OPEN:
+                d_open = volume / max(aPu[j, i], _EPS)
+                a_open = rhoP * dy * d_open / dx
+                self_u += rhoP * dy
+                self_p += a_open
+                rhs_abs += (
+                    a_open * flow_bc_p[EAST]
+                    - rhoP * dy * d_open * dpdx[j, i]
+                )
+
+        if kind_w == FACE_FLUID_FLUID:
+            dW = volume / max(aPu[j, i - 1], _EPS)
+            dP = volume / max(aPu[j, i], _EPS)
+            dw = 0.5 * (dW + dP)
+            rho_w = 0.5 * (rho[j, i - 1] + rho[j, i])
+            aWc = rho_w * dy * dw / dx
+            dpw_interp = rho_w * dy * dw * 0.5 * (dpdx[j, i] + dpdx[j, i - 1])
+            self_p += aWc
+            self_u -= rho_w * dy / 2.0
+            w_u = -rho_w * dy / 2.0
+            w_p = -aWc
+        elif kind_w == FACE_BOUNDARY:
+            code = int(flow_bc_code[WEST])
+            rhoP = rho[j, i]
+            if code == FLOW_BC_INLET:
+                rhs_abs += rhoP * dy * flow_bc_u[WEST]
+            elif code == FLOW_BC_OUTLET:
+                self_u -= rhoP * dy
+            elif code == FLOW_BC_OPEN:
+                d_open = volume / max(aPu[j, i], _EPS)
+                a_open = rhoP * dy * d_open / dx
+                self_u -= rhoP * dy
+                self_p += a_open
+                rhs_abs += (
+                    a_open * flow_bc_p[WEST]
+                    + rhoP * dy * d_open * dpdx[j, i]
+                )
+
+        if kind_n == FACE_FLUID_FLUID:
+            dP = volume / max(aPv[j, i], _EPS)
+            dN = volume / max(aPv[j + 1, i], _EPS)
+            dn = 0.5 * (dP + dN)
+            rho_n = 0.5 * (rho[j, i] + rho[j + 1, i])
+            aNc = rho_n * dx * dn / dy
+            dpn_interp = rho_n * dx * dn * 0.5 * (dpdy[j, i] + dpdy[j + 1, i])
+            self_p += aNc
+            self_v += rho_n * dx / 2.0
+            n_v = rho_n * dx / 2.0
+            n_p = -aNc
+            if buoyancy_enabled:
+                byP = _body_force_y(
+                    rho[j, i], beta[j, i], temperature[j, i],
+                    t_ref, gy, True
+                )
+                byN = _body_force_y(
+                    rho[j + 1, i], beta[j + 1, i], temperature[j + 1, i],
+                    t_ref, gy, True
+                )
+                by_face = 0.5 * (byP + byN)
+                byn_corr = rho_n * dx * (
+                    dn * by_face - 0.5 * (dP * byP + dN * byN)
+                )
+        elif kind_n == FACE_BOUNDARY:
+            code = int(flow_bc_code[NORTH])
+            rhoP = rho[j, i]
+            if code == FLOW_BC_INLET:
+                rhs_abs += -rhoP * dx * flow_bc_v[NORTH]
+            elif code == FLOW_BC_OUTLET:
+                self_v += rhoP * dx
+            elif code == FLOW_BC_OPEN:
+                d_open = volume / max(aPv[j, i], _EPS)
+                a_open = rhoP * dx * d_open / dy
+                self_v += rhoP * dx
+                self_p += a_open
+                rhs_abs += (
+                    a_open * flow_bc_p[NORTH]
+                    - rhoP * dx * d_open * dpdy[j, i]
+                )
+
+        if kind_s == FACE_FLUID_FLUID:
+            dS = volume / max(aPv[j - 1, i], _EPS)
+            dP = volume / max(aPv[j, i], _EPS)
+            ds = 0.5 * (dS + dP)
+            rho_s = 0.5 * (rho[j - 1, i] + rho[j, i])
+            aSc = rho_s * dx * ds / dy
+            dps_interp = rho_s * dx * ds * 0.5 * (dpdy[j - 1, i] + dpdy[j, i])
+            self_p += aSc
+            self_v -= rho_s * dx / 2.0
+            s_v = -rho_s * dx / 2.0
+            s_p = -aSc
+            if buoyancy_enabled:
+                byS = _body_force_y(
+                    rho[j - 1, i], beta[j - 1, i], temperature[j - 1, i],
+                    t_ref, gy, True
+                )
+                byP = _body_force_y(
+                    rho[j, i], beta[j, i], temperature[j, i],
+                    t_ref, gy, True
+                )
+                by_face = 0.5 * (byS + byP)
+                bys_corr = rho_s * dx * (
+                    ds * by_face - 0.5 * (dS * byS + dP * byP)
+                )
+        elif kind_s == FACE_BOUNDARY:
+            code = int(flow_bc_code[SOUTH])
+            rhoP = rho[j, i]
+            if code == FLOW_BC_INLET:
+                rhs_abs += rhoP * dx * flow_bc_v[SOUTH]
+            elif code == FLOW_BC_OUTLET:
+                self_v -= rhoP * dx
+            elif code == FLOW_BC_OPEN:
+                d_open = volume / max(aPv[j, i], _EPS)
+                a_open = rhoP * dx * d_open / dy
+                self_v -= rhoP * dx
+                self_p += a_open
+                rhs_abs += (
+                    a_open * flow_bc_p[SOUTH]
+                    + rhoP * dx * d_open * dpdy[j, i]
+                )
+
+        rhs_abs += (
+            -dpe_interp + dpw_interp - dpn_interp + dps_interp
+            + byn_corr - bys_corr
+        )
+
+        ax_old = 0.0
+        col = rp
+        value = self_p
+        _store_scaled_value_distributed(
+            local_data, pos, col, value, continuity_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += value * p_old[j, i]
+        pos += 1
+
+        col = ru
+        value = self_u
+        _store_scaled_value_distributed(
+            local_data, pos, col, value, continuity_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += value * u_old[j, i]
+        pos += 1
+
+        col = rv
+        value = self_v
+        _store_scaled_value_distributed(
+            local_data, pos, col, value, continuity_left_scale,
+            velocity_right_scale, pressure_right_scale
+        )
+        ax_old += value * v_old[j, i]
+        pos += 1
+
+        if nb_e >= 0:
+            col = 3 * nb_e
+            value = e_u
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j, i + 1]
+            pos += 1
+            col = 3 * nb_e + 2
+            value = e_p
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j, i + 1]
+            pos += 1
+        if nb_w >= 0:
+            col = 3 * nb_w
+            value = w_u
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * u_old[j, i - 1]
+            pos += 1
+            col = 3 * nb_w + 2
+            value = w_p
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j, i - 1]
+            pos += 1
+        if nb_n >= 0:
+            col = 3 * nb_n + 1
+            value = n_v
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j + 1, i]
+            pos += 1
+            col = 3 * nb_n + 2
+            value = n_p
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j + 1, i]
+            pos += 1
+        if nb_s >= 0:
+            col = 3 * nb_s + 1
+            value = s_v
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * v_old[j - 1, i]
+            pos += 1
+            col = 3 * nb_s + 2
+            value = s_p
+            _store_scaled_value_distributed(
+                local_data, pos, col, value, continuity_left_scale,
+                velocity_right_scale, pressure_right_scale
+            )
+            ax_old += value * p_old[j - 1, i]
+            pos += 1
+
+        local_rhs[lrp] = continuity_left_scale * (rhs_abs - ax_old)
+
+
+@njit(cache=True, fastmath=False)
+def fill_energy_local_coo_kernel(
+    nx: int,
+    owned_ny: int,
+    halo: int,
+    local_indptr: np.ndarray,
+    energy_face_kind: np.ndarray,
+    energy_neighbor_gid: np.ndarray,
+    heat_bc_code: np.ndarray,
+    heat_bc_T: np.ndarray,
+    heat_bc_q: np.ndarray,
+    is_fluid: np.ndarray,
+    k: np.ndarray,
+    qdot: np.ndarray,
+    temperature: np.ndarray,
+    me: np.ndarray,
+    mn: np.ndarray,
+    dTdx: np.ndarray,
+    dTdy: np.ndarray,
+    dx: float,
+    dy: float,
+    volume: float,
+    sou_enabled: bool,
+    sou_blend: float,
+    limiter_enabled: bool,
+    data: np.ndarray,
+    rhs: np.ndarray,
+) -> None:
+    """Fill only PETSc-owned energy rows from local+halo fields."""
+    data.fill(0.0)
+    rhs.fill(0.0)
+
+    for oj in range(owned_ny):
+        j = halo + oj
+        for i in range(nx):
+            lc = oj * nx + i
+            kP = k[j, i]
+            kind_e = int(energy_face_kind[lc, EAST])
+            kind_w = int(energy_face_kind[lc, WEST])
+            kind_n = int(energy_face_kind[lc, NORTH])
+            kind_s = int(energy_face_kind[lc, SOUTH])
+
+            aE = 0.0
+            aW = 0.0
+            aN = 0.0
+            aS = 0.0
+            Su = 0.0
+            Sp = 0.0
+
+            if kind_e != FACE_BOUNDARY:
+                kf = _harmonic_mean(kP, k[j, i + 1])
+                De = kf * dy / dx
+                if is_fluid[j, i] and kind_e == FACE_FLUID_FLUID:
+                    Fe = me[j, i]
+                    aE = De + max(-Fe, 0.0)
+                else:
+                    aE = De
+            else:
+                code = int(heat_bc_code[EAST])
+                if code == HEAT_BC_DIRICHLET:
+                    coeff = 2.0 * kP * dy / dx
+                    Sp -= coeff
+                    Su += coeff * heat_bc_T[EAST]
+                elif code == HEAT_BC_NEUMANN:
+                    Su += heat_bc_q[EAST] * dy
+
+            if kind_w != FACE_BOUNDARY:
+                kf = _harmonic_mean(kP, k[j, i - 1])
+                Dw = kf * dy / dx
+                if is_fluid[j, i] and kind_w == FACE_FLUID_FLUID:
+                    Fw = me[j, i - 1]
+                    aW = Dw + max(Fw, 0.0)
+                else:
+                    aW = Dw
+            else:
+                code = int(heat_bc_code[WEST])
+                if code == HEAT_BC_DIRICHLET:
+                    coeff = 2.0 * kP * dy / dx
+                    Sp -= coeff
+                    Su += coeff * heat_bc_T[WEST]
+                elif code == HEAT_BC_NEUMANN:
+                    Su += heat_bc_q[WEST] * dy
+
+            if kind_n != FACE_BOUNDARY:
+                kf = _harmonic_mean(kP, k[j + 1, i])
+                Dn = kf * dx / dy
+                if is_fluid[j, i] and kind_n == FACE_FLUID_FLUID:
+                    Fn = mn[j, i]
+                    aN = Dn + max(-Fn, 0.0)
+                else:
+                    aN = Dn
+            else:
+                code = int(heat_bc_code[NORTH])
+                if code == HEAT_BC_DIRICHLET:
+                    coeff = 2.0 * kP * dx / dy
+                    Sp -= coeff
+                    Su += coeff * heat_bc_T[NORTH]
+                elif code == HEAT_BC_NEUMANN:
+                    Su += heat_bc_q[NORTH] * dx
+
+            if kind_s != FACE_BOUNDARY:
+                kf = _harmonic_mean(kP, k[j - 1, i])
+                Ds = kf * dx / dy
+                if is_fluid[j, i] and kind_s == FACE_FLUID_FLUID:
+                    Fs = mn[j - 1, i]
+                    aS = Ds + max(Fs, 0.0)
+                else:
+                    aS = Ds
+            else:
+                code = int(heat_bc_code[SOUTH])
+                if code == HEAT_BC_DIRICHLET:
+                    coeff = 2.0 * kP * dx / dy
+                    Sp -= coeff
+                    Su += coeff * heat_bc_T[SOUTH]
+                elif code == HEAT_BC_NEUMANN:
+                    Su += heat_bc_q[SOUTH] * dx
+
+            if sou_enabled and is_fluid[j, i]:
+                Fe_corr = me[j, i] if kind_e == FACE_FLUID_FLUID else 0.0
+                Fw_corr = me[j, i - 1] if kind_w == FACE_FLUID_FLUID else 0.0
+                Fn_corr = mn[j, i] if kind_n == FACE_FLUID_FLUID else 0.0
+                Fs_corr = mn[j - 1, i] if kind_s == FACE_FLUID_FLUID else 0.0
+                Su += _sou_deferred_source(
+                    temperature, dTdx, dTdy, is_fluid, i, j,
+                    Fe_corr, Fw_corr, Fn_corr, Fs_corr,
+                    kind_e, kind_w, kind_n, kind_s,
+                    sou_blend, dx, dy, limiter_enabled
+                )
+
+            Su += qdot[j, i] * volume
+            aP = max(aE + aW + aN + aS - Sp, _EPS)
+
+            pos = int(local_indptr[lc])
+            data[pos] = aP
+            pos += 1
+            if int(energy_neighbor_gid[lc, EAST]) >= 0:
+                data[pos] = -aE
+                pos += 1
+            if int(energy_neighbor_gid[lc, WEST]) >= 0:
+                data[pos] = -aW
+                pos += 1
+            if int(energy_neighbor_gid[lc, NORTH]) >= 0:
+                data[pos] = -aN
+                pos += 1
+            if int(energy_neighbor_gid[lc, SOUTH]) >= 0:
+                data[pos] = -aS
+                pos += 1
+            rhs[lc] = Su

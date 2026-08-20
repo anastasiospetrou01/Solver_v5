@@ -233,6 +233,8 @@ def make_profile_record(
         "flow_linear_solve_s": float(flow_timing.get("flow_linear_solve", 0.0)),
         "flow_field_update_s": float(flow_timing.get("flow_field_update", 0.0)),
         "flow_coeff_update_s": float(flow_timing.get("flow_coeff_update", 0.0)),
+        "flow_field_halo_s": float(flow_timing.get("flow_field_halo", 0.0)),
+        "momentum_coefficient_halo_s": float(flow_timing.get("momentum_coefficient_halo", 0.0)),
         "flow_post_flux_s": float(flow_timing.get("flow_post_flux", 0.0)),
         "flow_coo_value_fill_s": float(flow_timing.get("flow_coo_value_fill", 0.0)),
         "flow_coo_matrix_update_s": float(flow_timing.get("flow_coo_matrix_update", 0.0)),
@@ -251,6 +253,7 @@ def make_profile_record(
         "energy_value_fill_s": float(energy_timing.get("energy_value_fill", 0.0)),
         "energy_linear_solve_s": float(energy_timing.get("energy_linear_solve", 0.0)),
         "energy_field_update_s": float(energy_timing.get("energy_field_update", 0.0)),
+        "energy_field_halo_s": float(energy_timing.get("energy_field_halo", 0.0)),
         "energy_coo_matrix_update_s": float(energy_timing.get("energy_coo_matrix_update", 0.0)),
         "energy_coo_rhs_update_s": float(energy_timing.get("energy_coo_rhs_update", 0.0)),
 
@@ -331,6 +334,8 @@ def print_timing_summary(summary: Dict[str, Any]) -> None:
         ("flow MUMPS factorization", "avg_flow_backend_factorization_s"),
         ("flow MUMPS solve", "avg_flow_backend_solve_s"),
         ("flow solution gather", "avg_flow_backend_solution_gather_s"),
+        ("flow field halo", "avg_flow_field_halo_s"),
+        ("momentum coeff halo", "avg_momentum_coefficient_halo_s"),
         ("flow post-flux", "avg_flow_post_flux_s"),
         ("metrics", "avg_metrics_s"),
         ("energy total", "avg_energy_total_s"),
@@ -339,6 +344,7 @@ def print_timing_summary(summary: Dict[str, Any]) -> None:
         ("  energy COO update", "avg_energy_coo_matrix_update_s"),
         ("  energy factorization", "avg_energy_backend_factorization_s"),
         ("  energy solve", "avg_energy_backend_solve_s"),
+        ("  energy field halo", "avg_energy_field_halo_s"),
     )
     for label, key in display:
         if key in summary:
@@ -373,7 +379,8 @@ Run setup:
     threads per rank = {flags.get('threads_per_rank', 1)}
     direct solver = {flags.get('direct_solver', 'mumps')}
     Numba kernels = {flags.get('use_numba', True)}
-    sparse update = fixed PETSc COO
+    sparse update = distributed fixed PETSc COO
+    decomposition = {flags.get('decomposition', 'structured_y_slab_halo2')}
     profiling basis = MPI maximum rank time
 
 Grid:

@@ -1,11 +1,11 @@
 ================ CASE INFORMATION ================
 case_name: buoyancy_cavity_1x1
-nx: 200
-ny: 200
+nx: 400
+ny: 400
 Lx: 1.0
 Ly: 1.0
-dx: 5.00000000e-03
-dy: 5.00000000e-03
+dx: 2.50000000e-03
+dy: 2.50000000e-03
 
 region_defs:
   id=0 | name=glycerin | material=glycerin | phase=fluid

@@ -16,7 +16,7 @@ RUN_SETTINGS = {
     "use_previous_solution": False,
     "restart_file": None,
 
-    "mpi_ranks": 4,
+    "mpi_ranks": 8,
     "threads_per_rank": 1,
 
     "max_iter": 200,
@@ -153,6 +153,11 @@ def _bootstrap_parallel_run() -> None:
     environment[_MPI_CHILD_FLAG] = "1"
     command = [
         launcher,
+        "--report-bindings",
+        "--map-by",
+        f"slot:PE={threads}",
+        "--bind-to",
+        "core",
         "-n",
         str(requested_ranks),
         sys.executable,
@@ -177,6 +182,7 @@ import numpy as np
 
 from case_io import load_case
 from geometry import build_fluid_index_map, build_masks, build_solver_topology
+from distributed_domain import StructuredSlabDomain, build_local_solver_topology
 from initial_conditions import build_initial_flow, build_initial_temperature
 from linear_backend import create_linear_solver
 from materials import build_material_fields, build_source_fields, materials
@@ -197,7 +203,6 @@ from solver_utils import (
     compute_global_mass_balance,
     compute_mass_residual,
     compute_pressure_gradients,
-    fluid_at,
     initialize_solver_workspace,
     snapshot_fields,
 )
@@ -323,14 +328,40 @@ def _build_internal_settings(nx: int, ny: int):
     return settings, p_ref_i, p_ref_j
 
 
-def _build_context(
+
+
+def _choose_pressure_reference(full_is_fluid, p_ref_i, p_ref_j):
+    ny, nx = full_is_fluid.shape
+    if 0 <= p_ref_i < nx and 0 <= p_ref_j < ny and full_is_fluid[p_ref_j, p_ref_i]:
+        return int(p_ref_i), int(p_ref_j)
+    locations = np.argwhere(full_is_fluid)
+    if locations.size == 0:
+        raise RuntimeError("The case contains no fluid cells.")
+    j, i = locations[0]
+    return int(i), int(j)
+
+
+def _pressure_reference_fid(full_is_fluid, p_ref_i, p_ref_j):
+    row_counts = np.count_nonzero(full_is_fluid, axis=1).astype(np.int64)
+    row_offsets = np.zeros(full_is_fluid.shape[0] + 1, dtype=np.int64)
+    row_offsets[1:] = np.cumsum(row_counts)
+    before = int(np.count_nonzero(full_is_fluid[p_ref_j, :p_ref_i]))
+    return int(row_offsets[p_ref_j] + before)
+
+
+def _build_distributed_context(
     geom,
     settings,
-    material_fields,
-    source_fields,
-    index_data,
+    domain,
+    topology,
+    local_masks,
+    local_material,
+    local_sources,
     p_ref_i,
     p_ref_j,
+    pressure_reference_fid,
+    rho_reference_scale,
+    mu_reference_scale,
 ):
     nx = int(geom["nx"])
     ny = int(geom["ny"])
@@ -346,6 +377,53 @@ def _build_context(
         "dx": dx,
         "dy": dy,
         "V": dx * dy,
+        "domain": domain,
+        "topology": topology,
+        "is_fluid": local_masks["fluid"],
+        "is_solid": local_masks["solid"],
+        "Nf": int(topology["Nf"]),
+        "local_Nf": int(topology["local_Nf"]),
+        "BC_flow": geom["boundaries"]["flow"],
+        "BC_heat": geom["boundaries"]["heat"],
+        "rho": local_material["rho"],
+        "mu": local_material["mu"],
+        "cp": local_material["cp"],
+        "k": local_material["k"],
+        "beta": local_material["beta"],
+        "qdot": local_sources["energy"],
+        "sx": local_sources["momentum_x"],
+        "sy": local_sources["momentum_y"],
+        "rho_reference_scale": float(rho_reference_scale),
+        "mu_reference_scale": float(mu_reference_scale),
+        "T_ref": float(RUN_SETTINGS["T_ref"]),
+        "gx": float(RUN_SETTINGS["gx"]),
+        "gy": float(RUN_SETTINGS["gy"]),
+        "use_pressure_reference": bool(RUN_SETTINGS["use_pressure_reference"]),
+        "p_ref_value": float(RUN_SETTINGS["p_ref_value"]),
+        "p_ref_i": int(p_ref_i),
+        "p_ref_j": int(p_ref_j),
+        "pressure_reference_fid": int(pressure_reference_fid),
+        "enable_sou_limiter": settings["schemes"].get("limiter", "none") != "none",
+        "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
+    }
+
+
+def _build_reporting_context(geom, settings, material_fields, source_fields, p_ref_i, p_ref_j):
+    """Recreate the old full-grid context only once on Rank 0 after convergence."""
+    geom["masks"] = build_masks(geom["region"], geom["region_defs"])
+    index_data = build_fluid_index_map(geom["region"], geom["region_defs"])
+    nx = int(geom["nx"])
+    ny = int(geom["ny"])
+    lx = float(geom["Lx"])
+    ly = float(geom["Ly"])
+    ctx = {
+        "nx": nx,
+        "ny": ny,
+        "Lx": lx,
+        "Ly": ly,
+        "dx": lx / nx,
+        "dy": ly / ny,
+        "V": (lx / nx) * (ly / ny),
         "is_fluid": geom["masks"]["fluid"],
         "is_solid": geom["masks"]["solid"],
         "fluid_cells": index_data["fluid_cells"],
@@ -364,17 +442,35 @@ def _build_context(
         "T_ref": float(RUN_SETTINGS["T_ref"]),
         "gx": float(RUN_SETTINGS["gx"]),
         "gy": float(RUN_SETTINGS["gy"]),
-        "use_pressure_reference": bool(
-            RUN_SETTINGS["use_pressure_reference"]
-        ),
+        "use_pressure_reference": bool(RUN_SETTINGS["use_pressure_reference"]),
         "p_ref_value": float(RUN_SETTINGS["p_ref_value"]),
         "p_ref_i": int(p_ref_i),
         "p_ref_j": int(p_ref_j),
-        "enable_sou_limiter": (
-            settings["schemes"].get("limiter", "none") != "none"
-        ),
+        "enable_sou_limiter": settings["schemes"].get("limiter", "none") != "none",
         "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
     }
+    ctx["topology"] = build_solver_topology(
+        nx=nx,
+        ny=ny,
+        is_fluid=ctx["is_fluid"],
+        is_solid=ctx["is_solid"],
+        index_data=index_data,
+        flow_boundaries=geom["boundaries"]["flow"],
+        heat_boundaries=geom["boundaries"]["heat"],
+    )
+    initialize_solver_workspace(ctx)
+    return ctx
+
+
+def _local_inf_change(domain, new, old, mask=None):
+    owned = domain.owned_slice
+    diff = np.abs(new[owned, :] - old[owned, :])
+    if mask is not None:
+        owned_mask = mask[owned, :]
+        local = float(np.max(diff[owned_mask])) if np.any(owned_mask) else 0.0
+    else:
+        local = float(np.max(diff)) if diff.size else 0.0
+    return domain.allreduce_max(local)
 
 
 def main() -> None:
@@ -386,8 +482,10 @@ def main() -> None:
     if not case_path.exists():
         raise FileNotFoundError(f"Case/restart file not found: {case_path}")
 
+    # Case metadata are initially loaded on every rank.  Full CFD arrays are
+    # immediately localized and released; only Rank 0 retains the case geometry
+    # needed for final NPZ output.
     geom = load_case(case_path)
-    geom["masks"] = build_masks(geom["region"], geom["region_defs"])
     case_name = str(geom["case_name"])
     nx = int(geom["nx"])
     ny = int(geom["ny"])
@@ -395,87 +493,103 @@ def main() -> None:
     ly = float(geom["Ly"])
     dx = lx / nx
     dy = ly / ny
-    is_fluid = geom["masks"]["fluid"]
-    is_solid = geom["masks"]["solid"]
-
     settings, p_ref_i, p_ref_j = _build_internal_settings(nx, ny)
-    material_fields = build_material_fields(geom, materials)
-    source_fields = build_source_fields(geom)
-    index_data = build_fluid_index_map(geom["region"], geom["region_defs"])
-    ctx = _build_context(
-        geom,
-        settings,
-        material_fields,
-        source_fields,
-        index_data,
-        p_ref_i,
-        p_ref_j,
-    )
-    ctx["topology"] = build_solver_topology(
-        nx=nx,
-        ny=ny,
-        is_fluid=is_fluid,
-        is_solid=is_solid,
-        index_data=index_data,
-        flow_boundaries=geom["boundaries"]["flow"],
-        heat_boundaries=geom["boundaries"]["heat"],
-    )
-    initialize_solver_workspace(ctx)
 
     linear_solver = create_linear_solver(settings["linear_solver"])
     mpi_rank = linear_solver.rank
     mpi_size = linear_solver.size
     is_root = mpi_rank == 0
-    requested_ranks = int(RUN_SETTINGS["mpi_ranks"])
-    if mpi_size != requested_ranks:
+    if mpi_size != int(RUN_SETTINGS["mpi_ranks"]):
         raise RuntimeError(
             f"PETSc started with {mpi_size} ranks, but RUN_SETTINGS requests "
-            f"{requested_ranks}."
+            f"{RUN_SETTINGS['mpi_ranks']}."
         )
+    mpi_comm = linear_solver.PETSc.COMM_WORLD.tompi4py()
+    domain = StructuredSlabDomain(nx, ny, mpi_comm, halo=2)
+
+    full_masks = build_masks(geom["region"], geom["region_defs"])
+    full_is_fluid = full_masks["fluid"]
+    full_is_solid = full_masks["solid"]
+    p_ref_i, p_ref_j = _choose_pressure_reference(full_is_fluid, p_ref_i, p_ref_j)
+    settings["pressure_reference"]["i"] = p_ref_i
+    settings["pressure_reference"]["j"] = p_ref_j
+    p_ref_fid = _pressure_reference_fid(full_is_fluid, p_ref_i, p_ref_j)
+
+    topology = build_local_solver_topology(
+        domain=domain,
+        global_is_fluid=full_is_fluid,
+        global_is_solid=full_is_solid,
+        flow_boundaries=geom["boundaries"]["flow"],
+        heat_boundaries=geom["boundaries"]["heat"],
+    )
+
+    full_material = build_material_fields(geom, materials)
+    full_sources = build_source_fields(geom)
+    if not np.any(full_is_fluid):
+        raise RuntimeError("The case contains no fluid cells.")
+    rho_reference_scale = float(np.median(full_material["rho"][full_is_fluid]))
+    mu_reference_scale = float(np.median(full_material["mu"][full_is_fluid]))
+
+    use_previous_solution = bool(RUN_SETTINGS["use_previous_solution"])
+    full_flow_initial = build_initial_flow(geom, prefer_solved=use_previous_solution)
+    full_temperature = build_initial_temperature(geom, prefer_solved=use_previous_solution)
+    full_flow_initial["u"][full_is_solid] = 0.0
+    full_flow_initial["v"][full_is_solid] = 0.0
+    full_flow_initial["p"][full_is_solid] = 0.0
+
+    local_masks = {
+        "fluid": domain.localize(full_is_fluid, False),
+        "solid": domain.localize(full_is_solid, False),
+    }
+    local_material = {name: domain.localize(value, 0.0) for name, value in full_material.items()}
+    local_sources = {name: domain.localize(value, 0.0) for name, value in full_sources.items()}
+    fields = {
+        "u": domain.localize(full_flow_initial["u"], 0.0),
+        "v": domain.localize(full_flow_initial["v"], 0.0),
+        "p": domain.localize(full_flow_initial["p"], 0.0),
+        "T": domain.localize(full_temperature, float(RUN_SETTINGS["T_ref"])),
+    }
+
+    ctx = _build_distributed_context(
+        geom,
+        settings,
+        domain,
+        topology,
+        local_masks,
+        local_material,
+        local_sources,
+        p_ref_i,
+        p_ref_j,
+        p_ref_fid,
+        rho_reference_scale,
+        mu_reference_scale,
+    )
+    initialize_solver_workspace(ctx)
+
+    aPu_lag = np.maximum(4.0 * local_material["mu"].copy(), 1.0e-6)
+    aPv_lag = np.maximum(4.0 * local_material["mu"].copy(), 1.0e-6)
+    aPu_lag[local_masks["solid"]] = 1.0
+    aPv_lag[local_masks["solid"]] = 1.0
+    coeffs = {"aPu": aPu_lag, "aPv": aPv_lag}
+    domain.exchange_many((fields["u"], fields["v"], fields["p"], fields["T"], coeffs["aPu"], coeffs["aPv"]))
+
+    # Full runtime CFD arrays are no longer replicated after this point.
+    del full_flow_initial, full_temperature, full_material, full_sources
+    del full_masks, full_is_fluid, full_is_solid
+    if not is_root:
+        # Only Rank 0 keeps the global region map for final result-file output.
+        geom.pop("region", None)
+        geom.pop("solved_flow", None)
+        geom.pop("solved_temperature", None)
 
     if is_root:
         print(f"Linear solver backend: {linear_solver.describe()}")
-        print(
-            f"MPI ranks: {mpi_size} | "
-            f"threads/rank: {int(RUN_SETTINGS['threads_per_rank'])}"
-        )
-        print(
-            "Performance path: Numba kernels + persistent PETSc fixed-COO updates"
-        )
-
-    use_previous_solution = bool(RUN_SETTINGS["use_previous_solution"])
-    flow_initial = build_initial_flow(
-        geom, prefer_solved=use_previous_solution
-    )
-    fields = {
-        "u": flow_initial["u"].copy(),
-        "v": flow_initial["v"].copy(),
-        "p": flow_initial["p"].copy(),
-        "T": build_initial_temperature(
-            geom, prefer_solved=use_previous_solution
-        ),
-    }
-    fields["u"][is_solid] = 0.0
-    fields["v"][is_solid] = 0.0
-    fields["p"][is_solid] = 0.0
-
-    aPu_lag = np.maximum(4.0 * material_fields["mu"].copy(), 1.0e-6)
-    aPv_lag = np.maximum(4.0 * material_fields["mu"].copy(), 1.0e-6)
-    aPu_lag[is_solid] = 1.0
-    aPv_lag[is_solid] = 1.0
-    coeffs = {"aPu": aPu_lag, "aPv": aPv_lag}
-
-    if (
-        RUN_SETTINGS["use_pressure_reference"]
-        and not fluid_at(ctx, p_ref_i, p_ref_j)
-    ):
-        if not ctx["fluid_cells"]:
-            raise RuntimeError("The case contains no fluid cells.")
-        p_ref_i, p_ref_j = ctx["fluid_cells"][0]
-        ctx["p_ref_i"] = p_ref_i
-        ctx["p_ref_j"] = p_ref_j
-        settings["pressure_reference"]["i"] = p_ref_i
-        settings["pressure_reference"]["j"] = p_ref_j
+        print(f"MPI ranks: {mpi_size} | threads/rank: {int(RUN_SETTINGS['threads_per_rank'])}")
+        print("Performance path: local+halo Numba kernels + persistent PETSc fixed-COO")
+        print(f"Domain decomposition: y-slabs with halo=2 ({ny} rows across {mpi_size} ranks)")
+        print(f"Loaded case/restart file: {case_path}")
+        print(f"Initialization mode: {initialization_mode}")
+        print(f"Use previous solution: {use_previous_solution}")
 
     if is_root:
         run_dir_value, run_tag = make_run_dir(
@@ -488,18 +602,9 @@ def main() -> None:
     run_dir = Path(run_payload[0])
     run_tag = str(run_payload[1])
 
-    if is_root:
-        print(f"Loaded case/restart file: {case_path}")
-        print(f"Initialization mode: {initialization_mode}")
-        print(f"Use previous solution: {use_previous_solution}")
-
     histories = {
-        "hist_it": [],
-        "hist_du": [],
-        "hist_dv": [],
-        "hist_dp": [],
-        "hist_dT": [],
-        "hist_mass": [],
+        "hist_it": [], "hist_du": [], "hist_dv": [], "hist_dp": [],
+        "hist_dT": [], "hist_mass": [],
     }
     profile_records = []
     profiling = settings["profiling"]
@@ -513,17 +618,14 @@ def main() -> None:
     fluxes = compute_face_fluxes(ctx, settings, fields, coeffs, gradients)
     fluxes.update({"dpdx": dpdx, "dpdy": dpdy, "gradients": gradients})
 
-    start_time = time.time()
+    start_time = time.perf_counter()
     try:
         for iteration in range(1, max_iter + 1):
             iteration_start = time.perf_counter()
             fields_old = snapshot_fields(ctx, fields)
 
             fields, coeffs, fluxes = solve_pressure_velocity(
-                ctx,
-                settings,
-                fields,
-                coeffs,
+                ctx, settings, fields, coeffs,
                 transient=None,
                 linear_solver=linear_solver,
                 old_fields=fields_old,
@@ -532,46 +634,30 @@ def main() -> None:
             gradients = fluxes["gradients"]
 
             if settings["physics"]["energy"]:
-                if not np.all(np.isfinite(fields["T"])):
-                    raise RuntimeError(
-                        "Non-finite temperature values exist before the energy solve."
-                    )
+                owned = domain.owned_slice
+                if not np.all(np.isfinite(fields["T"][owned, :])):
+                    raise RuntimeError("Non-finite temperature values exist before the energy solve.")
                 fields["T"] = solve_energy(
-                    ctx,
-                    settings,
-                    fields,
-                    fluxes,
+                    ctx, settings, fields, fluxes,
                     transient=None,
                     linear_solver=linear_solver,
                 )
                 energy_timing = settings.pop("_last_energy_timing", {})
-                dT_inf = float(
-                    np.max(np.abs(fields["T"] - fields_old["T"]))
-                )
+                dT_inf = _local_inf_change(domain, fields["T"], fields_old["T"])
             else:
                 energy_timing = {}
                 dT_inf = 0.0
 
             metrics_start = time.perf_counter()
-            du_inf = float(
-                np.max(np.abs((fields["u"] - fields_old["u"])[is_fluid]))
-            )
-            dv_inf = float(
-                np.max(np.abs((fields["v"] - fields_old["v"])[is_fluid]))
-            )
-            dp_inf = float(
-                np.max(np.abs((fields["p"] - fields_old["p"])[is_fluid]))
-            )
+            du_inf = _local_inf_change(domain, fields["u"], fields_old["u"], ctx["is_fluid"])
+            dv_inf = _local_inf_change(domain, fields["v"], fields_old["v"], ctx["is_fluid"])
+            dp_inf = _local_inf_change(domain, fields["p"], fields_old["p"], ctx["is_fluid"])
             mass_residual = float(
-                compute_mass_residual(
-                    ctx, settings, fields, coeffs, gradients, fluxes=fluxes
-                )
+                compute_mass_residual(ctx, settings, fields, coeffs, gradients, fluxes=fluxes)
             )
             metrics_time = time.perf_counter() - metrics_start
             outer_time = time.perf_counter() - iteration_start
 
-            # Phase A profiling reports the slowest MPI rank, which is the
-            # effective wall-clock cost of each synchronized stage.
             if profiling_enabled:
                 flow_timing = linear_solver.reduce_timing_max(flow_timing)
                 energy_timing = linear_solver.reduce_timing_max(energy_timing)
@@ -591,16 +677,12 @@ def main() -> None:
                     f"|du|inf {du_inf:.3e} |dv|inf {dv_inf:.3e}  "
                     f"|dp|inf {dp_inf:.3e} |dT|inf {dT_inf:.3e} | "
                     f"massRes {mass_residual:.3e} | "
-                    f"elapsed {time.time() - start_time:.2f}s"
+                    f"elapsed {time.perf_counter() - start_time:.2f}s"
                 )
 
             if profiling_enabled:
                 record = make_profile_record(
-                    iteration,
-                    outer_time,
-                    metrics_time,
-                    flow_timing,
-                    energy_timing,
+                    iteration, outer_time, metrics_time, flow_timing, energy_timing
                 )
                 profile_records.append(record)
                 if is_root and profiling["print_per_iteration"]:
@@ -614,59 +696,76 @@ def main() -> None:
                     print("Converged.")
                 break
 
+        # Final solution gather is intentionally performed only once, after the
+        # iterative solve.  There is no per-iteration all-gather in Phase F.
+        gathered_fields = {
+            name: domain.gather_owned_field(array, root=0)
+            for name, array in fields.items()
+        }
+        gathered_coeffs = {
+            name: domain.gather_owned_field(array, root=0)
+            for name, array in coeffs.items()
+        }
+
         if is_root:
+            total_time = time.perf_counter() - start_time
+            full_masks_report = build_masks(geom["region"], geom["region_defs"])
+            geom["masks"] = full_masks_report
+            material_fields = build_material_fields(geom, materials)
+            source_fields = build_source_fields(geom)
+            report_ctx = _build_reporting_context(
+                geom, settings, material_fields, source_fields, p_ref_i, p_ref_j
+            )
+            full_fields = gathered_fields
+            full_coeffs = gathered_coeffs
+            dpdx_full, dpdy_full = compute_pressure_gradients(report_ctx, full_fields["p"])
+            gradients_full = {"dpdx": dpdx_full, "dpdy": dpdy_full}
+            fluxes_full = compute_face_fluxes(
+                report_ctx, settings, full_fields, full_coeffs, gradients_full
+            )
+
             x_coordinates = np.linspace(dx / 2.0, lx - dx / 2.0, nx)
             y_coordinates = np.linspace(dy / 2.0, ly - dy / 2.0, ny)
-
             save_residual_history(
                 run_dir,
-                histories["hist_it"],
-                histories["hist_du"],
-                histories["hist_dv"],
-                histories["hist_dp"],
-                histories["hist_mass"],
-                histories["hist_dT"],
+                histories["hist_it"], histories["hist_du"], histories["hist_dv"],
+                histories["hist_dp"], histories["hist_mass"], histories["hist_dT"],
                 "residual_history.png",
             )
             save_case_with_results(
                 case_path,
                 geom,
                 run_tag=run_tag,
-                solution_fields=fields,
-                histories={
-                    key: np.asarray(value)
-                    for key, value in histories.items()
-                },
+                solution_fields=full_fields,
+                histories={key: np.asarray(value) for key, value in histories.items()},
                 coordinates={"x": x_coordinates, "y": y_coordinates},
                 extra_meta={
-                    "solver_name": "steady_v5_direct_mumps",
+                    "solver_name": "steady_v5_direct_mumps_phase_df",
                     "run_tag": run_tag,
                     "initialization_mode": initialization_mode,
                     "use_previous_solution": use_previous_solution,
                     "run_settings": RUN_SETTINGS,
+                    "decomposition": "structured_y_slab_halo2",
                 },
             )
 
-            total_time = time.time() - start_time
             mass_balance = compute_global_mass_balance(
-                ctx, fields, coeffs, gradients
+                report_ctx, full_fields, full_coeffs, gradients_full
             )
             energy_balance = compute_global_energy_balance(
-                ctx, settings, fields, coeffs, fluxes, gradients
+                report_ctx, settings, full_fields, full_coeffs, fluxes_full, gradients_full
             )
 
             timing_csv_path = None
             if profiling_enabled and profiling["save_timing_csv"]:
                 timing_csv_path = write_timing_csv(
-                    run_dir / f"timing_history_{run_tag}.csv",
-                    profile_records,
+                    run_dir / f"timing_history_{run_tag}.csv", profile_records
                 )
-            timing_summary = summarize_timing(
-                profile_records, timing_csv_path
-            )
+            timing_summary = summarize_timing(profile_records, timing_csv_path)
             if profiling_enabled and profiling["print_summary"]:
                 print_timing_summary(timing_summary)
 
+            is_fluid_global = full_masks_report["fluid"]
             report_data = {
                 "setup": {
                     "case_name": case_name,
@@ -678,41 +777,25 @@ def main() -> None:
                 "grid": {"nx": nx, "ny": ny, "dx": dx, "dy": dy},
                 "cells": {
                     "total": nx * ny,
-                    "fluid": int(np.sum(is_fluid)),
-                    "solid": int(np.sum(is_solid)),
+                    "fluid": int(np.sum(is_fluid_global)),
+                    "solid": int(np.sum(full_masks_report["solid"])),
                 },
                 "properties": {
-                    "rho_min": float(np.min(material_fields["rho"][is_fluid])),
-                    "rho_max": float(np.max(material_fields["rho"][is_fluid])),
-                    "mu_min": float(np.min(material_fields["mu"][is_fluid])),
-                    "mu_max": float(np.max(material_fields["mu"][is_fluid])),
-                    "beta_min": float(
-                        np.min(material_fields["beta"][is_fluid])
-                    ),
-                    "beta_max": float(
-                        np.max(material_fields["beta"][is_fluid])
-                    ),
+                    "rho_min": float(np.min(material_fields["rho"][is_fluid_global])),
+                    "rho_max": float(np.max(material_fields["rho"][is_fluid_global])),
+                    "mu_min": float(np.min(material_fields["mu"][is_fluid_global])),
+                    "mu_max": float(np.max(material_fields["mu"][is_fluid_global])),
+                    "beta_min": float(np.min(material_fields["beta"][is_fluid_global])),
+                    "beta_max": float(np.max(material_fields["beta"][is_fluid_global])),
                 },
                 "flags": {
                     "ENABLE_ENERGY": bool(RUN_SETTINGS["enable_energy"]),
-                    "ENABLE_BUOYANCY": bool(
-                        RUN_SETTINGS["enable_buoyancy"]
-                    ),
-                    "ENABLE_SOU_MOMENTUM": bool(
-                        RUN_SETTINGS["enable_sou_momentum"]
-                    ),
-                    "ENABLE_SOU_ENERGY": bool(
-                        RUN_SETTINGS["enable_sou_energy"]
-                    ),
-                    "SOU_BLEND_MOMENTUM": float(
-                        RUN_SETTINGS["sou_blend_momentum"]
-                    ),
-                    "SOU_BLEND_ENERGY": float(
-                        RUN_SETTINGS["sou_blend_energy"]
-                    ),
-                    "ENABLE_SOU_LIMITER": bool(
-                        RUN_SETTINGS["enable_sou_limiter"]
-                    ),
+                    "ENABLE_BUOYANCY": bool(RUN_SETTINGS["enable_buoyancy"]),
+                    "ENABLE_SOU_MOMENTUM": bool(RUN_SETTINGS["enable_sou_momentum"]),
+                    "ENABLE_SOU_ENERGY": bool(RUN_SETTINGS["enable_sou_energy"]),
+                    "SOU_BLEND_MOMENTUM": float(RUN_SETTINGS["sou_blend_momentum"]),
+                    "SOU_BLEND_ENERGY": float(RUN_SETTINGS["sou_blend_energy"]),
+                    "ENABLE_SOU_LIMITER": bool(RUN_SETTINGS["enable_sou_limiter"]),
                     "alpha_u": float(RUN_SETTINGS["alpha_u"]),
                     "alpha_v": float(RUN_SETTINGS["alpha_v"]),
                     "alpha_p": float(RUN_SETTINGS["alpha_p"]),
@@ -724,20 +807,15 @@ def main() -> None:
                     "gx": float(RUN_SETTINGS["gx"]),
                     "gy": float(RUN_SETTINGS["gy"]),
                     "mpi_ranks": mpi_size,
-                    "threads_per_rank": int(
-                        RUN_SETTINGS["threads_per_rank"]
-                    ),
-                    "direct_solver": str(
-                        RUN_SETTINGS["direct_solver"]["solver_type"]
-                    ),
-                    "use_numba": bool(
-                        RUN_SETTINGS.get("performance", {}).get("use_numba", True)
-                    ),
+                    "threads_per_rank": int(RUN_SETTINGS["threads_per_rank"]),
+                    "direct_solver": str(RUN_SETTINGS["direct_solver"]["solver_type"]),
+                    "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
+                    "decomposition": "structured_y_slab_halo2",
                 },
                 "histories": histories,
                 "temperature": {
-                    "Tmin": float(np.min(fields["T"])),
-                    "Tmax": float(np.max(fields["T"])),
+                    "Tmin": float(np.min(full_fields["T"])),
+                    "Tmax": float(np.max(full_fields["T"])),
                 },
                 "sources": {
                     "qdot_min": float(np.min(source_fields["energy"])),
@@ -751,16 +829,13 @@ def main() -> None:
                 "energy_balance": energy_balance,
                 "performance": {
                     "total_time": total_time,
-                    "avg_time_per_iter": total_time
-                    / max(len(histories["hist_it"]), 1),
+                    "avg_time_per_iter": total_time / max(len(histories["hist_it"]), 1),
                     "profiling_enabled": profiling_enabled,
                     "timing_summary": timing_summary,
                 },
             }
             save_simulation_report(
-                run_dir,
-                f"simulation_report_{run_tag}.txt",
-                report_data,
+                run_dir, f"simulation_report_{run_tag}.txt", report_data
             )
             print(f"\nSaved thermo-flow results to: {run_dir}")
     except Exception:

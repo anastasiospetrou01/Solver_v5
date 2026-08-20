@@ -1,11 +1,11 @@
 ================ CASE INFORMATION ================
 case_name: wake_test
-nx: 150
-ny: 50
+nx: 300
+ny: 100
 Lx: 3.0
 Ly: 1.0
-dx: 2.00000000e-02
-dy: 2.00000000e-02
+dx: 1.00000000e-02
+dy: 1.00000000e-02
 
 region_defs:
   id=0 | name=glycerin | material=glycerin | phase=fluid

@@ -1,26 +1,16 @@
 from __future__ import annotations
 
-"""Optimized fixed-pattern coupled flow assembly for Solver V5.
+"""Distributed fixed-COO coupled flow assembly for Solver V5 (Phase D/F)."""
 
-Phase A/B/C implementation:
-- static fluid topology is precomputed once in geometry.py;
-- momentum and row-value kernels are Numba compiled;
-- no per-row Python dictionaries are created;
-- the sparse pattern is fixed once and updated through PETSc COO values;
-- serial and MPI runs use the same finite-volume equations.
-"""
-
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import time
 from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
-from scipy import sparse
 
 from flow_scaling import FlowScaling, build_flow_scaling
 from numerical_kernels import (
-    build_state_vector_kernel,
-    fill_flow_local_coo_kernel,
+    fill_flow_local_coo_distributed_kernel,
     momentum_pass_kernel,
 )
 from solver_utils import (
@@ -29,45 +19,21 @@ from solver_utils import (
     compute_pressure_gradients,
     initialize_solver_workspace,
 )
-from geometry import (
-    EAST,
-    WEST,
-    NORTH,
-    SOUTH,
-    FACE_FLUID_FLUID,
-    FLOW_BC_OPEN,
-)
+from geometry import EAST, WEST, NORTH, SOUTH, FLOW_BC_OPEN
 
 
 @dataclass
-class FixedCSRPattern:
-    indptr: np.ndarray
-    indices: np.ndarray
+class LocalCOOPattern:
+    local_indptr: np.ndarray
+    rows: np.ndarray
+    cols: np.ndarray
+    row_start: int
+    row_end: int
     pattern_key: Tuple[Any, ...]
-    _local_cache: Dict[Tuple[int, int], Tuple[np.ndarray, np.ndarray, int, int]] = field(
-        default_factory=dict, repr=False
-    )
 
     @property
     def nnz(self) -> int:
-        return int(self.indices.size)
-
-    def local_coo(self, row_start: int, row_end: int):
-        key = (int(row_start), int(row_end))
-        cached = self._local_cache.get(key)
-        if cached is not None:
-            return cached
-
-        nz_start = int(self.indptr[row_start])
-        nz_end = int(self.indptr[row_end])
-        counts = np.diff(self.indptr[row_start : row_end + 1])
-        rows = np.repeat(
-            np.arange(row_start, row_end, dtype=np.int64), counts
-        )
-        cols = np.asarray(self.indices[nz_start:nz_end], dtype=np.int64)
-        cached = (rows, cols, nz_start, nz_end)
-        self._local_cache[key] = cached
-        return cached
+        return int(self.cols.size)
 
 
 @dataclass
@@ -89,53 +55,35 @@ class MomentumPass:
     timing: Dict[str, float]
 
 
-def _gidx_f(fid: int, variable: int) -> int:
-    return 3 * int(fid) + int(variable)
-
-
 def _resolve_pressure_constraint(ctx: Dict[str, Any], settings: Dict[str, Any]) -> str:
     cfg = settings.get("pressure_reference", {})
     mode = str(cfg.get("mode", "auto")).lower().strip()
     if mode not in ("auto", "pin", "nullspace", "none"):
         raise ValueError(f"Unsupported pressure constraint mode: {mode!r}")
-
-    topology = ctx["topology"]
     has_pressure_boundary = bool(
-        np.any(topology["flow_bc_code"] == FLOW_BC_OPEN)
+        np.any(ctx["topology"]["flow_bc_code"] == FLOW_BC_OPEN)
     )
     if mode == "auto":
         return "none" if has_pressure_boundary else "pin"
     if mode == "nullspace":
+        # Direct LU requires a nonsingular matrix; retain validated pin behavior.
         return "pin"
     return mode
 
 
-def _pressure_reference_cell(ctx, settings):
-    cfg = settings.get("pressure_reference", {})
-    i = int(cfg.get("i", ctx.get("p_ref_i", 0)))
-    j = int(cfg.get("j", ctx.get("p_ref_j", 0)))
-    if (
-        0 <= i < int(ctx["nx"])
-        and 0 <= j < int(ctx["ny"])
-        and bool(ctx["is_fluid"][j, i])
-    ):
-        return i, j
-    if int(ctx["Nf"]) == 0:
-        raise RuntimeError("No fluid cells are available for the pressure reference.")
-    return int(ctx["topology"]["fluid_i"][0]), int(ctx["topology"]["fluid_j"][0])
-
-
 def _pressure_reference_row(ctx, settings, mode: str) -> Optional[int]:
+    del settings
     if mode != "pin":
         return None
-    i, j = _pressure_reference_cell(ctx, settings)
-    fid = int(ctx["cell_to_fid"][j, i])
-    return _gidx_f(fid, 2)
+    fid = int(ctx.get("pressure_reference_fid", -1))
+    if fid < 0:
+        raise RuntimeError("A valid pressure-reference fluid cell is required.")
+    return 3 * fid + 2
 
 
 def _ensure_momentum_workspace(ctx):
     workspace = initialize_solver_workspace(ctx)
-    shape = (int(ctx["ny"]), int(ctx["nx"]))
+    shape = ctx["is_fluid"].shape
     for name, fill in (
         ("mom_aE", 0.0),
         ("mom_aW", 0.0),
@@ -157,7 +105,6 @@ def _ensure_momentum_workspace(ctx):
 
 
 def build_momentum_pass(ctx, settings, fields, lagged_coeffs) -> MomentumPass:
-    """Compute the complete nonlinear momentum coefficient pass in JIT kernels."""
     timing: Dict[str, float] = {}
     topology = ctx["topology"]
     workspace = _ensure_momentum_workspace(ctx)
@@ -168,9 +115,7 @@ def build_momentum_pass(ctx, settings, fields, lagged_coeffs) -> MomentumPass:
     gradients = {"dpdx": dpdx, "dpdy": dpdy}
 
     stage = time.perf_counter()
-    fluxes = compute_face_fluxes(
-        ctx, settings, fields, lagged_coeffs, gradients
-    )
+    fluxes = compute_face_fluxes(ctx, settings, fields, lagged_coeffs, gradients)
     timing["momentum_pre_flux"] = time.perf_counter() - stage
 
     sou_enabled = str(settings["schemes"].get("momentum", "upwind")).lower() == "sou"
@@ -183,7 +128,6 @@ def build_momentum_pass(ctx, settings, fields, lagged_coeffs) -> MomentumPass:
             ctx, fields["v"], ctx["is_fluid"], workspace_slot=2
         )
     else:
-        # Kernels still require typed arrays; these are never read when SOU is off.
         dudx = workspace["grad_x_1"]
         dudy = workspace["grad_y_1"]
         dvdx = workspace["grad_x_2"]
@@ -236,6 +180,12 @@ def build_momentum_pass(ctx, settings, fields, lagged_coeffs) -> MomentumPass:
     )
     timing["momentum_coefficients"] = time.perf_counter() - stage
 
+    # Continuity rows at partition interfaces use neighbour aP values.  Only
+    # these two new coefficient fields require halo exchange before row fill.
+    stage = time.perf_counter()
+    ctx["domain"].exchange_many((workspace["mom_aPu"], workspace["mom_aPv"]))
+    timing["momentum_coefficient_halo"] = time.perf_counter() - stage
+
     return MomentumPass(
         aE=workspace["mom_aE"],
         aW=workspace["mom_aW"],
@@ -255,27 +205,30 @@ def build_momentum_pass(ctx, settings, fields, lagged_coeffs) -> MomentumPass:
     )
 
 
-def build_flow_pattern(ctx) -> FixedCSRPattern:
-    """Create the exact fixed coupled sparsity pattern once per case."""
+def build_flow_pattern(ctx) -> LocalCOOPattern:
     existing = ctx.get("flow_pattern")
     if existing is not None:
         return existing
 
-    nf = int(ctx["Nf"])
-    neighbor = ctx["topology"]["neighbor_fid"]
+    topology = ctx["topology"]
+    neighbor = topology["neighbor_fid"]
+    local_nf = int(topology["local_Nf"])
+    fid_start = int(topology["fid_start"])
+    row_start = 3 * fid_start
+    row_end = row_start + 3 * local_nf
+
     indptr = [0]
     indices = []
-
-    for fid in range(nf):
-        nb_e = int(neighbor[fid, EAST])
-        nb_w = int(neighbor[fid, WEST])
-        nb_n = int(neighbor[fid, NORTH])
-        nb_s = int(neighbor[fid, SOUTH])
+    for lfid in range(local_nf):
+        fid = fid_start + lfid
+        nb_e = int(neighbor[lfid, EAST])
+        nb_w = int(neighbor[lfid, WEST])
+        nb_n = int(neighbor[lfid, NORTH])
+        nb_s = int(neighbor[lfid, SOUTH])
         ru = 3 * fid
         rv = ru + 1
         rp = ru + 2
 
-        # u row: self u, neighbour velocities, self p, x-neighbour pressures.
         cols = [ru]
         if nb_e >= 0:
             cols.append(3 * nb_e)
@@ -293,7 +246,6 @@ def build_flow_pattern(ctx) -> FixedCSRPattern:
         indices.extend(cols)
         indptr.append(len(indices))
 
-        # v row: self v, neighbour velocities, self p, y-neighbour pressures.
         cols = [rv]
         if nb_e >= 0:
             cols.append(3 * nb_e + 1)
@@ -311,7 +263,6 @@ def build_flow_pattern(ctx) -> FixedCSRPattern:
         indices.extend(cols)
         indptr.append(len(indices))
 
-        # continuity row: self p/u/v followed by E/W/N/S neighbour pairs.
         cols = [rp, ru, rv]
         if nb_e >= 0:
             cols.extend((3 * nb_e, 3 * nb_e + 2))
@@ -324,37 +275,30 @@ def build_flow_pattern(ctx) -> FixedCSRPattern:
         indices.extend(cols)
         indptr.append(len(indices))
 
-    pattern = FixedCSRPattern(
-        indptr=np.asarray(indptr, dtype=np.int64),
-        indices=np.asarray(indices, dtype=np.int64),
+    local_indptr = np.asarray(indptr, dtype=np.int64)
+    cols = np.asarray(indices, dtype=np.int64)
+    counts = np.diff(local_indptr)
+    rows = np.repeat(np.arange(row_start, row_end, dtype=np.int64), counts)
+
+    pattern = LocalCOOPattern(
+        local_indptr=local_indptr,
+        rows=rows,
+        cols=cols,
+        row_start=row_start,
+        row_end=row_end,
         pattern_key=(
-            "v5_phase_abc_flow_coo",
+            "v5_phase_df_flow_local_coo",
             int(ctx["nx"]),
             int(ctx["ny"]),
-            nf,
-            int(len(indices)),
+            int(ctx["Nf"]),
+            int(ctx["domain"].size),
+            row_start,
+            row_end,
+            int(cols.size),
         ),
     )
     ctx["flow_pattern"] = pattern
     return pattern
-
-
-def build_state_vector(ctx, fields) -> np.ndarray:
-    workspace = initialize_solver_workspace(ctx)
-    ndof = 3 * int(ctx["Nf"])
-    state = workspace.get("flow_state")
-    if state is None or state.size != ndof:
-        state = np.empty(ndof, dtype=float)
-        workspace["flow_state"] = state
-    build_state_vector_kernel(
-        ctx["topology"]["fluid_i"],
-        ctx["topology"]["fluid_j"],
-        fields["u"],
-        fields["v"],
-        fields["p"],
-        state,
-    )
-    return state
 
 
 @dataclass
@@ -362,21 +306,34 @@ class FlowCOOLinearSystem:
     ctx: Dict[str, Any]
     settings: Dict[str, Any]
     fields: Dict[str, np.ndarray]
+    old_fields: Dict[str, np.ndarray]
     momentum: MomentumPass
-    old_state: np.ndarray
     scaling: FlowScaling
     pressure_constraint_mode: str
     pressure_reference_row: Optional[int]
-    pattern: FixedCSRPattern
+    pattern: LocalCOOPattern
     assembly_timing: Dict[str, float]
 
     is_fixed_coo: bool = True
     is_distributed_local: bool = True
+    returns_local_solution: bool = True
     block_size: int = 3
 
     @property
     def global_size(self) -> int:
-        return int(self.old_state.size)
+        return 3 * int(self.ctx["Nf"])
+
+    @property
+    def local_size(self) -> int:
+        return int(self.pattern.row_end - self.pattern.row_start)
+
+    @property
+    def row_start(self) -> int:
+        return int(self.pattern.row_start)
+
+    @property
+    def row_end(self) -> int:
+        return int(self.pattern.row_end)
 
     @property
     def pattern_key(self):
@@ -393,42 +350,36 @@ class FlowCOOLinearSystem:
             "pressure_constraint_mode": self.pressure_constraint_mode,
             "distributed_local_assembly": True,
             "fixed_coo": True,
+            "returns_local_solution": True,
             "pattern_key": self.pattern_key,
         }
 
-    def local_coo_pattern(self, row_start: int, row_end: int):
-        rows, cols, _nz0, _nz1 = self.pattern.local_coo(row_start, row_end)
-        return rows, cols
+    def local_coo_pattern(self, *_args):
+        return self.pattern.rows, self.pattern.cols
 
     def assemble_petsc(self, mat, rhs_vec, row_start: int, row_end: int):
         from petsc4py import PETSc
 
-        if row_start % 3 or row_end % 3:
+        if int(row_start) != self.row_start or int(row_end) != self.row_end:
             raise RuntimeError(
-                "PETSc ownership must be aligned to complete [u,v,p] cell blocks."
+                "PETSc flow ownership does not match the geometric y-slab ownership: "
+                f"PETSc={row_start}:{row_end}, expected={self.row_start}:{self.row_end}."
             )
-        fid_start = row_start // 3
-        fid_end = row_end // 3
-        _rows, _cols, nz_start, nz_end = self.pattern.local_coo(
-            row_start, row_end
-        )
 
         workspace = initialize_solver_workspace(self.ctx)
-        cache_key = ("flow_local_coo", row_start, row_end, nz_end - nz_start)
-        local = workspace.get(cache_key)
+        key = ("flow_local_coo_df", self.row_start, self.row_end, self.pattern.nnz)
+        local = workspace.get(key)
         if local is None:
             local = {
-                "data": np.empty(nz_end - nz_start, dtype=float),
-                "rhs": np.empty(row_end - row_start, dtype=float),
+                "data": np.empty(self.pattern.nnz, dtype=float),
+                "rhs": np.empty(self.local_size, dtype=float),
             }
-            workspace[cache_key] = local
+            workspace[key] = local
 
         stage = time.perf_counter()
-        fill_flow_local_coo_kernel(
-            fid_start,
-            fid_end,
-            nz_start,
-            self.pattern.indptr,
+        fill_flow_local_coo_distributed_kernel(
+            int(self.ctx["topology"]["fid_start"]),
+            self.pattern.local_indptr,
             self.ctx["topology"]["fluid_i"],
             self.ctx["topology"]["fluid_j"],
             self.ctx["topology"]["neighbor_fid"],
@@ -442,6 +393,9 @@ class FlowCOOLinearSystem:
             self.ctx["sx"],
             self.ctx["sy"],
             self.fields["T"],
+            self.old_fields["u"],
+            self.old_fields["v"],
+            self.old_fields["p"],
             self.momentum.aE,
             self.momentum.aW,
             self.momentum.aN,
@@ -452,9 +406,10 @@ class FlowCOOLinearSystem:
             self.momentum.source_v,
             self.momentum.gradients["dpdx"],
             self.momentum.gradients["dpdy"],
-            self.old_state,
-            self.scaling.left,
-            self.scaling.right,
+            float(self.scaling.momentum_equation_scale),
+            float(self.scaling.continuity_equation_scale),
+            float(self.scaling.velocity_scale),
+            float(self.scaling.pressure_scale),
             float(self.ctx["dx"]),
             float(self.ctx["dy"]),
             float(self.ctx["V"]),
@@ -466,32 +421,37 @@ class FlowCOOLinearSystem:
             local["data"],
             local["rhs"],
         )
-        value_fill_time = time.perf_counter() - stage
+        value_fill = time.perf_counter() - stage
 
         stage = time.perf_counter()
         mat.setValuesCOO(
             np.asarray(local["data"], dtype=PETSc.ScalarType),
             addv=PETSc.InsertMode.INSERT_VALUES,
         )
-        coo_update_time = time.perf_counter() - stage
+        matrix_update = time.perf_counter() - stage
 
         stage = time.perf_counter()
         rhs_array = rhs_vec.getArray()
         rhs_array[:] = np.asarray(local["rhs"], dtype=rhs_array.dtype)
         rhs_vec.assemble()
-        rhs_time = time.perf_counter() - stage
+        rhs_update = time.perf_counter() - stage
 
         return {
-            "local_fid_start": float(fid_start),
-            "local_fid_end": float(fid_end),
-            "local_cells": float(fid_end - fid_start),
-            "coo_value_fill": value_fill_time,
-            "coo_matrix_update": coo_update_time,
-            "coo_rhs_update": rhs_time,
+            "local_cells": float(self.ctx["topology"]["local_Nf"]),
+            "coo_value_fill": value_fill,
+            "coo_matrix_update": matrix_update,
+            "coo_rhs_update": rhs_update,
         }
 
     def recover_correction(self, scaled_solution: np.ndarray) -> np.ndarray:
-        return self.scaling.unscale_solution(scaled_solution)
+        workspace = initialize_solver_workspace(self.ctx)
+        out = workspace.get("flow_local_correction")
+        if out is None or out.size != scaled_solution.size:
+            out = np.empty_like(np.asarray(scaled_solution, dtype=float))
+            workspace["flow_local_correction"] = out
+        return self.scaling.unscale_local_solution(
+            scaled_solution, self.row_start, out=out
+        )
 
     def distributed_residual_metrics(self, mat, rhs_vec, solution_vec):
         from petsc4py import PETSc
@@ -506,11 +466,7 @@ class FlowCOOLinearSystem:
         )
         scaled_rel = scaled_abs / scaled_rhs
 
-        row_start, row_end = mat.getOwnershipRange()
-        local_left = np.asarray(
-            self.scaling.left[row_start:row_end], dtype=float
-        )
-
+        local_left = self.scaling.local_left(self.row_start, self.row_end)
         physical_residual = residual.duplicate()
         physical_residual.getArray()[:] = (
             np.asarray(residual.getArray(readonly=True), dtype=float) / local_left
@@ -523,9 +479,7 @@ class FlowCOOLinearSystem:
         )
         physical_rhs.assemble()
 
-        unscaled_abs = float(
-            physical_residual.norm(PETSc.NormType.NORM_INFINITY)
-        )
+        unscaled_abs = float(physical_residual.norm(PETSc.NormType.NORM_INFINITY))
         unscaled_rhs = max(
             float(physical_rhs.norm(PETSc.NormType.NORM_INFINITY)), 1.0e-30
         )
@@ -550,10 +504,10 @@ def assemble_flow_correction_system(
     fields: Dict[str, np.ndarray],
     lagged_coeffs: Dict[str, np.ndarray],
     *,
+    old_fields: Dict[str, np.ndarray],
     distributed: bool = True,
 ):
-    """Build one fixed-pattern PETSc COO correction-system descriptor."""
-    del distributed  # one canonical path is used for both serial and MPI.
+    del distributed
     total = time.perf_counter()
     timing: Dict[str, float] = {}
 
@@ -569,19 +523,14 @@ def assemble_flow_correction_system(
     timing["flow_pattern_lookup"] = time.perf_counter() - stage
 
     stage = time.perf_counter()
-    old_state_workspace = build_state_vector(ctx, fields)
-    # The system survives field updates until the linear solve completes.  The
-    # reusable workspace may be overwritten on the next iteration, not before.
-    old_state = old_state_workspace
-    timing["flow_state_vector"] = time.perf_counter() - stage
-
-    stage = time.perf_counter()
     scaling_cfg = (
         settings.get("linear_solver", {})
         .get("flow_coupled", {})
         .get("scaling", {})
     )
-    scaling = build_flow_scaling(ctx, fields, old_state.size, scaling_cfg)
+    scaling = build_flow_scaling(
+        ctx, fields, 3 * int(ctx["Nf"]), scaling_cfg
+    )
     timing["flow_scaling"] = time.perf_counter() - stage
     timing["flow_assembly_total"] = time.perf_counter() - total
 
@@ -589,91 +538,11 @@ def assemble_flow_correction_system(
         ctx=ctx,
         settings=settings,
         fields=fields,
+        old_fields=old_fields,
         momentum=momentum,
-        old_state=old_state,
         scaling=scaling,
         pressure_constraint_mode=constraint_mode,
         pressure_reference_row=reference_row,
         pattern=pattern,
         assembly_timing=timing,
-    )
-
-
-def reconstruct_serial_absolute_system(
-    ctx: Dict[str, Any],
-    settings: Dict[str, Any],
-    fields: Dict[str, np.ndarray],
-    momentum: MomentumPass,
-    pressure_constraint_mode: str,
-):
-    """Regression helper: reconstruct unscaled absolute A and b from fixed COO."""
-    pattern = build_flow_pattern(ctx)
-    ndof = 3 * int(ctx["Nf"])
-    zeros = np.zeros(ndof, dtype=float)
-    ones = np.ones(ndof, dtype=float)
-    data = np.empty(pattern.nnz, dtype=float)
-    rhs = np.empty(ndof, dtype=float)
-    reference_row = _pressure_reference_row(
-        ctx, settings, pressure_constraint_mode
-    )
-
-    fill_flow_local_coo_kernel(
-        0,
-        int(ctx["Nf"]),
-        0,
-        pattern.indptr,
-        ctx["topology"]["fluid_i"],
-        ctx["topology"]["fluid_j"],
-        ctx["topology"]["neighbor_fid"],
-        ctx["topology"]["face_kind"],
-        ctx["topology"]["flow_bc_code"],
-        ctx["topology"]["flow_bc_u"],
-        ctx["topology"]["flow_bc_v"],
-        ctx["topology"]["flow_bc_p"],
-        ctx["rho"],
-        ctx["beta"],
-        ctx["sx"],
-        ctx["sy"],
-        fields["T"],
-        momentum.aE,
-        momentum.aW,
-        momentum.aN,
-        momentum.aS,
-        momentum.aPu,
-        momentum.aPv,
-        momentum.source_u,
-        momentum.source_v,
-        momentum.gradients["dpdx"],
-        momentum.gradients["dpdy"],
-        zeros,
-        ones,
-        ones,
-        float(ctx["dx"]),
-        float(ctx["dy"]),
-        float(ctx["V"]),
-        float(ctx["T_ref"]),
-        float(ctx["gy"]),
-        bool(settings["physics"].get("buoyancy", False)),
-        int(reference_row if reference_row is not None else -1),
-        float(settings.get("pressure_reference", {}).get("value", 0.0)),
-        data,
-        rhs,
-    )
-    matrix = sparse.csr_matrix(
-        (data.copy(), pattern.indices.copy(), pattern.indptr.copy()),
-        shape=(ndof, ndof),
-    )
-    return matrix, rhs.copy()
-
-
-# Backward-compatible regression name used by earlier tests.
-def reconstruct_serial_from_rows(
-    ctx,
-    settings,
-    fields,
-    momentum,
-    pressure_constraint_mode,
-):
-    return reconstruct_serial_absolute_system(
-        ctx, settings, fields, momentum, pressure_constraint_mode
     )

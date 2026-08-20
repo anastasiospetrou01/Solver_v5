@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-"""Persistent PETSc/MUMPS direct solver with fixed-pattern COO updates."""
+"""Persistent PETSc/MUMPS direct solver with distributed fixed-COO updates."""
 
 import hashlib
 import sys
@@ -100,8 +100,9 @@ def _true_residual(matrix, rhs, solution, norm_type: str = "inf") -> Tuple[float
 class PetscDirectSolver:
     """Persistent sparse direct solver using PETSc LU and MUMPS.
 
-    Phase C uses MatSetPreallocationCOO once and MatSetValuesCOO on every
-    nonlinear iteration for both the coupled flow and scalar energy matrices.
+    Phase D/F retains persistent fixed-COO matrices while allowing the CFD
+    decomposition to prescribe PETSc local row ownership and return only each
+    rank's local solution vector.
     """
 
     supports_pressure_nullspace = False
@@ -190,7 +191,7 @@ class PetscDirectSolver:
         return reduced
 
     def describe(self) -> str:
-        mode = "distributed fixed-COO assembly" if self.size > 1 else "serial fixed-COO assembly"
+        mode = "distributed local-field fixed-COO assembly" if self.size > 1 else "serial fixed-COO assembly"
         return f"PETSc direct LU ({self.config.get('solver_type', 'mumps')}, {mode})"
 
     def _system_options(self, system_type: str) -> Dict[str, Any]:
@@ -280,6 +281,9 @@ class PetscDirectSolver:
         key,
         global_size: int,
         block_size: int,
+        local_size: int,
+        expected_row_start: int,
+        expected_row_end: int,
         pattern_signature,
         preallocation_nnz: int,
         options: Dict[str, Any],
@@ -289,18 +293,16 @@ class PetscDirectSolver:
         coo_cols=None,
     ) -> _PetscDirectCache:
         PETSc = self.PETSc
-        local_size, row_start, row_end = self._local_layout(global_size, block_size, comm)
 
         matrix = PETSc.Mat().create(comm=comm)
-        matrix.setSizes(((local_size, global_size), (local_size, global_size)))
+        matrix.setSizes(((int(local_size), int(global_size)), (int(local_size), int(global_size))))
         matrix.setType(PETSc.Mat.Type.AIJ)
         matrix.setBlockSize(int(block_size))
 
         if fixed_coo:
             if not hasattr(matrix, "setPreallocationCOO"):
                 raise RuntimeError(
-                    "This PETSc/petsc4py build does not provide Mat.setPreallocationCOO. "
-                    "PETSc 3.15 or newer is required for the Phase C fixed-COO path."
+                    "This PETSc/petsc4py build does not provide Mat.setPreallocationCOO."
                 )
             matrix.setPreallocationCOO(
                 np.asarray(coo_rows, dtype=PETSc.IntType).copy(),
@@ -310,6 +312,17 @@ class PetscDirectSolver:
             matrix.setPreallocationNNZ(max(int(preallocation_nnz), 1))
         matrix.setOption(PETSc.Mat.Option.KEEP_NONZERO_PATTERN, True)
         matrix.setUp()
+
+        row_start, row_end = matrix.getOwnershipRange()
+        row_start = int(row_start)
+        row_end = int(row_end)
+        if row_start != int(expected_row_start) or row_end != int(expected_row_end):
+            matrix.destroy()
+            raise RuntimeError(
+                "PETSc ownership does not match the structured CFD decomposition: "
+                f"PETSc={row_start}:{row_end}, expected="
+                f"{expected_row_start}:{expected_row_end}."
+            )
 
         rhs = matrix.createVecLeft()
         solution = matrix.createVecRight()
@@ -359,21 +372,33 @@ class PetscDirectSolver:
         is_local_legacy = bool(getattr(matrix_or_system, "is_distributed_local", False)) and not is_fixed_coo
         matrix_csr = None
         coo_rows = coo_cols = None
+        comm = self.comm
 
         if is_fixed_coo:
             global_size = int(matrix_or_system.global_size)
             block_size = int(getattr(matrix_or_system, "block_size", metadata.get("block_size", 1)))
             signature = getattr(matrix_or_system, "pattern_key", (global_size, block_size, "coo"))
-            comm = self.comm
-            _local_size, row_start, row_end = self._local_layout(global_size, block_size, comm)
-            coo_rows, coo_cols = matrix_or_system.local_coo_pattern(row_start, row_end)
+
+            if hasattr(matrix_or_system, "local_size"):
+                local_size = int(matrix_or_system.local_size)
+                expected_row_start = int(matrix_or_system.row_start)
+                expected_row_end = int(matrix_or_system.row_end)
+            else:
+                local_size, expected_row_start, expected_row_end = self._local_layout(
+                    global_size, block_size, comm
+                )
+            coo_rows, coo_cols = matrix_or_system.local_coo_pattern(
+                expected_row_start, expected_row_end
+            )
             preallocation = max(int(options.get("preallocation_nnz", 1)), 1)
         elif is_local_legacy:
             global_size = int(matrix_or_system.global_size)
             block_size = int(getattr(matrix_or_system, "block_size", metadata.get("block_size", 1)))
             signature = getattr(matrix_or_system, "pattern_key", (global_size, block_size, "local"))
+            local_size, expected_row_start, expected_row_end = self._local_layout(
+                global_size, block_size, comm
+            )
             preallocation = int(getattr(matrix_or_system, "preallocation_nnz", options.get("preallocation_nnz", 20)))
-            comm = self.comm
         else:
             matrix_csr = self._as_csr(matrix_or_system)
             if matrix_csr.shape[0] != matrix_csr.shape[1]:
@@ -383,9 +408,14 @@ class PetscDirectSolver:
             signature = self._pattern_signature(matrix_csr)
             row_nnz = np.diff(matrix_csr.indptr)
             preallocation = int(max(np.max(row_nnz) if row_nnz.size else 1, 1))
-            comm = self.comm
+            local_size, expected_row_start, expected_row_end = self._local_layout(
+                global_size, block_size, comm
+            )
 
-        key = (system_type, int(comm.getSize()), global_size, block_size)
+        key = (
+            system_type, int(comm.getSize()), global_size, block_size,
+            int(local_size), int(expected_row_start), int(expected_row_end)
+        )
         cache = self._caches.get(key)
         if cache is not None and cache.pattern_signature != signature:
             self._destroy_cache(cache)
@@ -397,6 +427,9 @@ class PetscDirectSolver:
                 key=key,
                 global_size=global_size,
                 block_size=block_size,
+                local_size=local_size,
+                expected_row_start=expected_row_start,
+                expected_row_end=expected_row_end,
                 pattern_signature=signature,
                 preallocation_nnz=preallocation,
                 options=options,
@@ -516,7 +549,13 @@ class PetscDirectSolver:
             pc_failed = 0
 
         gather_start = time.perf_counter()
-        solution = self._gather_solution(cache.solution, cache.comm)
+        returns_local = bool(getattr(matrix_or_system, "returns_local_solution", False))
+        if returns_local:
+            solution = np.asarray(
+                cache.solution.getArray(readonly=True), dtype=float
+            ).copy()
+        else:
+            solution = self._gather_solution(cache.solution, cache.comm)
         timing["solution_gather"] = time.perf_counter() - gather_start
 
         residual_start = time.perf_counter()

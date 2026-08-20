@@ -224,8 +224,7 @@ def south_face_kind(ctx, i, j):
 # ------------------------------------------------------------
 def initialize_solver_workspace(ctx):
     """Allocate reusable full-field work arrays once per case."""
-    ny = int(ctx["ny"])
-    nx = int(ctx["nx"])
+    ny, nx = ctx["is_fluid"].shape
     workspace = ctx.setdefault("workspace", {})
 
     def ensure(name, shape=(ny, nx), fill=0.0):
@@ -274,16 +273,18 @@ def require_numba(ctx):
 
 
 def compute_pressure_gradients(ctx, p):
+    """Pressure gradients on owned + ghost cells.
+
+    In Phase F the ghost layer must also receive valid gradients because
+    Rhie-Chow interpolation at partition interfaces reads neighbour gradients.
+    """
     require_numba(ctx)
     workspace = initialize_solver_workspace(ctx)
     dpdx = workspace["dpdx"]
     dpdy = workspace["dpdy"]
-    topology = ctx["topology"]
-    pressure_gradients_kernel(
+    cell_gradients_kernel(
         np.asarray(p, dtype=float),
-        ctx["is_fluid"],
-        topology["fluid_i"],
-        topology["fluid_j"],
+        np.asarray(ctx["is_fluid"], dtype=np.bool_),
         float(ctx["dx"]),
         float(ctx["dy"]),
         dpdx,
@@ -538,12 +539,24 @@ def compute_face_fluxes(ctx, settings, fields, coeffs, gradients):
 # Residuals and balances
 # ------------------------------------------------------------
 def compute_mass_residual(ctx, settings, fields, coeffs, gradients, fluxes=None):
-    """Maximum cell continuity imbalance using already reconstructed face fluxes."""
+    """Global maximum continuity imbalance from local owned fluid cells."""
     require_numba(ctx)
     if fluxes is None:
         fluxes = compute_face_fluxes(ctx, settings, fields, coeffs, gradients)
     topology = ctx["topology"]
-    return float(
+
+    p_ref_i = int(ctx.get("p_ref_i", -1))
+    p_ref_j = int(ctx.get("p_ref_j", -1))
+    domain = ctx.get("domain")
+    if domain is not None:
+        if domain.owns_global_j(p_ref_j):
+            p_ref_j_kernel = domain.global_to_local_j(p_ref_j)
+        else:
+            p_ref_j_kernel = -10**9
+    else:
+        p_ref_j_kernel = p_ref_j
+
+    local_value = float(
         mass_residual_kernel(
             topology["fluid_i"],
             topology["fluid_j"],
@@ -566,10 +579,11 @@ def compute_mass_residual(ctx, settings, fields, coeffs, gradients, fluxes=None)
             float(ctx["dx"]),
             float(ctx["dy"]),
             bool(ctx.get("use_pressure_reference", False)),
-            int(ctx.get("p_ref_i", -1)),
-            int(ctx.get("p_ref_j", -1)),
+            p_ref_i,
+            int(p_ref_j_kernel),
         )
     )
+    return domain.allreduce_max(local_value) if domain is not None else local_value
 
 
 def compute_global_mass_balance(ctx, fields, coeffs, gradients):
