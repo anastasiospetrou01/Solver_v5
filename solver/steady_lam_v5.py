@@ -16,8 +16,10 @@ RUN_SETTINGS = {
     "use_previous_solution": False,
     "restart_file": None,
 
-    "mpi_ranks": 8,
-    "threads_per_rank": 1,
+    # Number of CPU processors/workers to use.
+    # 1 .. physical cores  -> one MPI rank per physical core
+    # above physical cores -> SMT/logical processors are used automatically
+    "processors": 8,
 
     "max_iter": 200,
     "tol_mass": 1.0e-6,
@@ -79,7 +81,7 @@ RUN_SETTINGS = {
     },
 
     "profiling": {
-        "enabled": True,
+        "enabled": False,
         "print_per_iteration": True,
         "save_timing_csv": False,
         "print_summary": True,
@@ -96,6 +98,8 @@ import subprocess
 import sys
 
 _MPI_CHILD_FLAG = "V5_MPI_CHILD"
+_PHYSICAL_CORES_ENV = "V5_PHYSICAL_CORES"
+_LOGICAL_CPUS_ENV = "V5_LOGICAL_CPUS"
 
 
 def _detected_mpi_size():
@@ -114,58 +118,197 @@ def _detected_mpi_size():
     return None
 
 
+def _detect_cpu_topology():
+    """
+    Return the CPU topology detected by the original parent process.
+
+    Once MPI ranks are bound to individual cores, sched_getaffinity()
+    only sees the CPUs assigned to that rank. Therefore the parent
+    detects the full available topology before mpiexec and passes it
+    to all MPI children through environment variables.
+    """
+
+    # --------------------------------------------------------
+    # MPI children use the topology detected by the parent.
+    # --------------------------------------------------------
+    saved_physical = os.environ.get(_PHYSICAL_CORES_ENV)
+    saved_logical = os.environ.get(_LOGICAL_CPUS_ENV)
+
+    if saved_physical is not None and saved_logical is not None:
+        return int(saved_physical), int(saved_logical)
+
+    # --------------------------------------------------------
+    # Parent process: determine CPUs currently available.
+    # --------------------------------------------------------
+    try:
+        available_cpus = set(os.sched_getaffinity(0))
+        logical_cpus = len(available_cpus)
+    except (AttributeError, OSError):
+        available_cpus = None
+        logical_cpus = os.cpu_count() or 1
+
+    physical_cores = None
+
+    try:
+        result = subprocess.run(
+            ["lscpu", "-p=CPU,CORE,SOCKET"],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+
+        cores = set()
+
+        for line in result.stdout.splitlines():
+            line = line.strip()
+
+            if not line or line.startswith("#"):
+                continue
+
+            cpu_str, core_str, socket_str = line.split(",")
+
+            cpu = int(cpu_str)
+            core = int(core_str)
+            socket = int(socket_str)
+
+            # On the parent process this filters to CPUs actually
+            # available to WSL/Linux.
+            if available_cpus is not None and cpu not in available_cpus:
+                continue
+
+            cores.add((socket, core))
+
+        if cores:
+            physical_cores = len(cores)
+
+    except Exception:
+        pass
+
+    if physical_cores is None:
+        physical_cores = logical_cpus
+
+    return physical_cores, logical_cpus
+
+
 def _bootstrap_parallel_run() -> None:
-    requested_ranks = int(RUN_SETTINGS["mpi_ranks"])
-    threads = int(RUN_SETTINGS["threads_per_rank"])
-    if requested_ranks < 1:
-        raise ValueError("RUN_SETTINGS['mpi_ranks'] must be at least 1.")
-    if threads < 1:
-        raise ValueError("RUN_SETTINGS['threads_per_rank'] must be at least 1.")
 
-    thread_value = str(threads)
-    os.environ["OMP_NUM_THREADS"] = thread_value
-    os.environ["OPENBLAS_NUM_THREADS"] = thread_value
-    os.environ["MKL_NUM_THREADS"] = thread_value
-    os.environ["NUMEXPR_NUM_THREADS"] = thread_value
-    os.environ["NUMBA_NUM_THREADS"] = thread_value
+    requested_processors = int(RUN_SETTINGS["processors"])
 
+    # Detect whether we are already inside an MPI launch.
     detected_size = _detected_mpi_size()
+
+    # --------------------------------------------------------
+    # MPI CHILD PROCESS
+    # --------------------------------------------------------
     if detected_size is not None:
-        if detected_size != requested_ranks:
+
+        if detected_size != requested_processors:
             raise RuntimeError(
                 "The active MPI launch has "
                 f"{detected_size} ranks, but RUN_SETTINGS requests "
-                f"{requested_ranks}. Run without mpiexec or use matching values."
+                f"{requested_processors} processors."
             )
+
+        # Always keep numerical libraries single-threaded because
+        # the current production parallel model is pure MPI.
+        os.environ["OMP_NUM_THREADS"] = "1"
+        os.environ["OPENBLAS_NUM_THREADS"] = "1"
+        os.environ["MKL_NUM_THREADS"] = "1"
+        os.environ["NUMEXPR_NUM_THREADS"] = "1"
+        os.environ["NUMBA_NUM_THREADS"] = "1"
+
         return
 
-    if os.environ.get(_MPI_CHILD_FLAG) == "1" or requested_ranks == 1:
+    # --------------------------------------------------------
+    # ORIGINAL PARENT PROCESS
+    # --------------------------------------------------------
+    physical_cores, logical_cpus = _detect_cpu_topology()
+
+    if requested_processors < 1:
+        raise ValueError(
+            "RUN_SETTINGS['processors'] must be at least 1."
+        )
+
+    if requested_processors > logical_cpus:
+        raise ValueError(
+            f"Requested {requested_processors} processors, "
+            f"but Linux currently provides only "
+            f"{logical_cpus} logical CPUs."
+        )
+
+    requested_ranks = requested_processors
+
+    # Current implementation:
+    # one MPI rank = one CPU worker.
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["NUMEXPR_NUM_THREADS"] = "1"
+    os.environ["NUMBA_NUM_THREADS"] = "1"
+
+    # Single-rank case does not need mpiexec.
+    if requested_processors == 1:
+
+        # Preserve topology for reporting.
+        os.environ[_PHYSICAL_CORES_ENV] = str(physical_cores)
+        os.environ[_LOGICAL_CPUS_ENV] = str(logical_cpus)
+
         return
 
     launcher = shutil.which("mpiexec") or shutil.which("mpirun")
+
     if launcher is None:
         raise RuntimeError(
-            "mpi_ranks is greater than 1, but neither mpiexec nor mpirun "
-            "was found in PATH."
+            "More than one processor was requested, but neither "
+            "mpiexec nor mpirun was found in PATH."
         )
 
     environment = os.environ.copy()
+
+    # Store the topology BEFORE MPI changes process affinity.
     environment[_MPI_CHILD_FLAG] = "1"
-    command = [
-        launcher,
-        "--report-bindings",
-        "--map-by",
-        f"slot:PE={threads}",
-        "--bind-to",
-        "core",
-        "-n",
-        str(requested_ranks),
-        sys.executable,
-        "-m",
-        "solver.steady_lam_v5",
-        *sys.argv[1:],
-    ]
-    completed = subprocess.run(command, env=environment, check=False)
+    environment[_PHYSICAL_CORES_ENV] = str(physical_cores)
+    environment[_LOGICAL_CPUS_ENV] = str(logical_cpus)
+
+    # --------------------------------------------------------
+    # CPU PLACEMENT
+    # --------------------------------------------------------
+    if requested_processors <= physical_cores:
+
+        # Prefer one MPI rank on each separate physical core.
+        command = [
+            launcher,
+            "--report-bindings",
+            "--map-by", "core",
+            "--bind-to", "core",
+            "-n", str(requested_ranks),
+            sys.executable,
+            "-m", "solver.steady_lam_v5",
+            *sys.argv[1:],
+        ]
+
+    else:
+
+        # More workers than physical cores:
+        # deliberately use SMT hardware threads.
+        command = [
+            launcher,
+            "--report-bindings",
+            "--use-hwthread-cpus",
+            "--map-by", "hwthread",
+            "--bind-to", "hwthread",
+            "-n", str(requested_ranks),
+            sys.executable,
+            "-m", "solver.steady_lam_v5",
+            *sys.argv[1:],
+        ]
+
+    completed = subprocess.run(
+        command,
+        env=environment,
+        check=False,
+    )
+
     raise SystemExit(completed.returncode)
 
 
@@ -499,10 +642,12 @@ def main() -> None:
     mpi_rank = linear_solver.rank
     mpi_size = linear_solver.size
     is_root = mpi_rank == 0
-    if mpi_size != int(RUN_SETTINGS["mpi_ranks"]):
+    requested_processors = int(RUN_SETTINGS["processors"])
+
+    if mpi_size != requested_processors:
         raise RuntimeError(
-            f"PETSc started with {mpi_size} ranks, but RUN_SETTINGS requests "
-            f"{RUN_SETTINGS['mpi_ranks']}."
+            f"PETSc started with {mpi_size} MPI ranks, but "
+            f"RUN_SETTINGS requests {requested_processors} processors."
         )
     mpi_comm = linear_solver.PETSc.COMM_WORLD.tompi4py()
     domain = StructuredSlabDomain(nx, ny, mpi_comm, halo=2)
@@ -584,7 +729,16 @@ def main() -> None:
 
     if is_root:
         print(f"Linear solver backend: {linear_solver.describe()}")
-        print(f"MPI ranks: {mpi_size} | threads/rank: {int(RUN_SETTINGS['threads_per_rank'])}")
+        physical_cores, logical_cpus = _detect_cpu_topology()
+        using_smt = int(RUN_SETTINGS["processors"]) > physical_cores
+        print("")
+        print("Parallel configuration:")
+        print(f"  Requested processors : {int(RUN_SETTINGS['processors'])}")
+        print(f"  Physical CPU cores    : {physical_cores}")
+        print(f"  Logical CPUs          : {logical_cpus}")
+        print(f"  MPI ranks             : {mpi_size}")
+        print("  Threads per MPI rank  : 1")
+        print(f"  SMT used              : {'Yes' if using_smt else 'No'}")
         print("Performance path: local+halo Numba kernels + persistent PETSc fixed-COO")
         print(f"Domain decomposition: y-slabs with halo=2 ({ny} rows across {mpi_size} ranks)")
         print(f"Loaded case/restart file: {case_path}")
@@ -806,8 +960,12 @@ def main() -> None:
                     "T_ref": float(RUN_SETTINGS["T_ref"]),
                     "gx": float(RUN_SETTINGS["gx"]),
                     "gy": float(RUN_SETTINGS["gy"]),
+                    "processors": int(RUN_SETTINGS["processors"]),
                     "mpi_ranks": mpi_size,
-                    "threads_per_rank": int(RUN_SETTINGS["threads_per_rank"]),
+                    "threads_per_rank": 1,
+                    "physical_cores": physical_cores,
+                    "logical_cpus": logical_cpus,
+                    "smt_used": bool(using_smt),
                     "direct_solver": str(RUN_SETTINGS["direct_solver"]["solver_type"]),
                     "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
                     "decomposition": "structured_y_slab_halo2",
