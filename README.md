@@ -122,25 +122,13 @@ $$
 $$
 
 ### Momentum
-
 $$
-\rho (\mathbf{u}\cdot\nabla)\mathbf{u}
-=
--\nabla p
-+
-\mu\nabla^2\mathbf{u}
-+
-\mathbf{S}
+\rho (\mathbf{u}\cdot\nabla)\mathbf{u}=-\nabla p+\mu \nabla^2 \mathbf{u}+\mathbf{S}
 $$
-
 ### Energy
 
 $$
-\rho c_p (\mathbf{u}\cdot\nabla T)
-=
-\nabla\cdot(k\nabla T)
-+
-\dot{q}
+\rho c_p (\mathbf{u}\cdot\nabla T)=\nabla\cdot(k\nabla T)+\dot{q}
 $$
 
 For buoyant flows, a Boussinesq body-force contribution can be enabled.
