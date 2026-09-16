@@ -597,3 +597,12 @@ Developed as an ongoing CFD and high-performance scientific-computing project fo
 - solver optimization
 - thermal and buoyancy-driven flows
 - scalable scientific software development
+
+## License
+
+Copyright © 2026 Anastasios Petrou. All rights reserved.
+
+This repository is publicly visible for research and development
+purposes. No permission is granted to use, reproduce, modify,
+distribute, or incorporate this source code into other works without
+prior written permission.
