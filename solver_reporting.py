@@ -244,6 +244,13 @@ def make_profile_record(
         "flow_backend_matrix_rhs_update_s": float(flow_backend.get("matrix_rhs_update", 0.0)),
         "flow_backend_factorization_s": float(flow_backend.get("factorization_setup", 0.0)),
         "flow_backend_solve_s": float(flow_backend.get("triangular_solve", 0.0)),
+        "flow_backend_pc_setup_s": float(flow_backend.get("pc_setup", 0.0)),
+        "flow_backend_ksp_solve_s": float(flow_backend.get("ksp_solve", 0.0)),
+        "flow_backend_krylov_iterations": float(flow_backend.get("krylov_iterations", 0.0)),
+        "flow_backend_krylov_iterations_last": float(flow_backend.get("krylov_iterations_last", 0.0)),
+        "flow_backend_ksp_residual": float(flow_backend.get("ksp_residual", 0.0)),
+        "flow_backend_physical_residual_retries": float(flow_backend.get("physical_residual_retries", 0.0)),
+        "flow_backend_effective_rtol": float(flow_backend.get("effective_rtol", 0.0)),
         "flow_backend_solution_gather_s": float(flow_backend.get("solution_gather", 0.0)),
         "flow_backend_residual_check_s": float(flow_backend.get("true_residual_check", 0.0)),
 
@@ -273,8 +280,12 @@ def print_iteration_timing(record: Dict[str, float]) -> None:
         f"mom={record['flow_momentum_pass_s']:.3f}s | "
         f"rowFill={record['flow_coo_value_fill_s']:.3f}s | "
         f"mat={record['flow_coo_matrix_update_s']:.3f}s | "
-        f"MUMPS={record['flow_backend_factorization_s']:.3f}s | "
-        f"solve={record['flow_backend_solve_s']:.3f}s | "
+        f"directFact={record['flow_backend_factorization_s']:.3f}s | "
+        f"directSolve={record['flow_backend_solve_s']:.3f}s | "
+        f"pcSetup={record.get('flow_backend_pc_setup_s', 0.0):.3f}s | "
+        f"ksp={record.get('flow_backend_ksp_solve_s', 0.0):.3f}s | "
+        f"KrylovIts={record.get('flow_backend_krylov_iterations', 0.0):.0f} | "
+        f"retries={record.get('flow_backend_physical_residual_retries', 0.0):.0f} | "
         f"gather={record['flow_backend_solution_gather_s']:.3f}s | "
         f"postFlux={record['flow_post_flux_s']:.3f}s | "
         f"energy={record['energy_total_s']:.3f}s"
@@ -331,8 +342,13 @@ def print_timing_summary(summary: Dict[str, Any]) -> None:
         ("  momentum coefficients", "avg_momentum_coefficients_s"),
         ("flow COO value fill", "avg_flow_coo_value_fill_s"),
         ("flow COO matrix update", "avg_flow_coo_matrix_update_s"),
-        ("flow MUMPS factorization", "avg_flow_backend_factorization_s"),
-        ("flow MUMPS solve", "avg_flow_backend_solve_s"),
+        ("flow direct factorization", "avg_flow_backend_factorization_s"),
+        ("flow direct solve", "avg_flow_backend_solve_s"),
+        ("flow iterative PC setup", "avg_flow_backend_pc_setup_s"),
+        ("flow iterative KSP solve", "avg_flow_backend_ksp_solve_s"),
+        ("flow Krylov iterations", "avg_flow_backend_krylov_iterations"),
+        ("flow residual retries", "avg_flow_backend_physical_residual_retries"),
+        ("flow effective KSP rtol", "avg_flow_backend_effective_rtol"),
         ("flow solution gather", "avg_flow_backend_solution_gather_s"),
         ("flow field halo", "avg_flow_field_halo_s"),
         ("momentum coeff halo", "avg_momentum_coefficient_halo_s"),
@@ -377,7 +393,8 @@ Run setup:
     restart_file = {setup['restart_file'] if setup['restart_file'] is not None else 'None'}
     MPI ranks = {flags.get('mpi_ranks', 1)}
     threads per rank = {flags.get('threads_per_rank', 1)}
-    direct solver = {flags.get('direct_solver', 'mumps')}
+    linear solver = {flags.get('linear_solver', flags.get('direct_solver', 'mumps'))}
+    direct fallback/reference = {flags.get('direct_solver', 'mumps')}
     Numba kernels = {flags.get('use_numba', True)}
     sparse update = distributed fixed PETSc COO
     decomposition = {flags.get('decomposition', 'structured_y_slab_halo2')}

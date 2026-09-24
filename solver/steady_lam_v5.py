@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 # ============================================================
-# RUN SETTINGS — DIRECT-LU PRODUCTION VERSION
+# RUN SETTINGS — MUMPS REFERENCE + ITERATIVE FLOW RESEARCH
 # ============================================================
 # Edit this dictionary to select the case, solver controls and MPI ranks.
 # Run the solver with:
@@ -21,7 +21,7 @@ RUN_SETTINGS = {
     # above physical cores -> SMT/logical processors are used automatically
     "processors": 8,
 
-    "max_iter": 200,
+    "max_iter": 10,
     "tol_mass": 1.0e-6,
     "tol_T": 1.0e-6,
 
@@ -52,6 +52,66 @@ RUN_SETTINGS = {
     "sou_blend_energy": 0.7,
     "enable_sou_limiter": True,
 
+    # Coupled-flow linear backend. Keep "mumps" as the production/reference
+    # baseline; use "iterative" for the Stage-1 FGMRES/Schur research path.
+    "linear_solver_type": "iterative",
+
+    "iterative_solver": {
+        "ksp_type": "fgmres",
+        "rtol": 1.0e-6,
+        "atol": 0.0,
+        "dtol": 1.0e8,
+        "max_it": 200,
+        "restart": 50,
+        "schur_fact_type": "lower",
+        "schur_pre_type": "selfp",
+        # Stage 1: deliberately strong block solves to validate the Schur
+        # architecture before introducing AMG.
+        "velocity_solver": "hypre",
+        "velocity_ksp_type": "gmres",
+        "velocity_ksp_rtol": 1.0e-2,
+        "velocity_ksp_atol": 0.0,
+        "velocity_ksp_dtol": 1.0e8,
+        "velocity_ksp_max_it": 10,
+        "velocity_ksp_restart": 10,
+        "velocity_boomeramg_max_iter": 1,
+        "velocity_boomeramg_tol": 0.0,
+
+        # Stage 3E: use a single fixed BoomerAMG V-cycle for A00^{-1}
+        # inside every matrix-free Schur matvec.
+        "schur_inner_velocity_ksp_type": "preonly",
+        "schur_inner_velocity_solver": "hypre",
+        "schur_inner_velocity_boomeramg_max_iter": 1,
+        "schur_inner_velocity_boomeramg_tol": 0.0,
+
+        # Stage 3F: same cheap one-cycle AMG approximation for the separate
+        # upper-factor A00 solve used by FULL Schur factorization.
+        "schur_upper_velocity_ksp_type": "preonly",
+        "schur_upper_velocity_solver": "hypre",
+        "schur_upper_velocity_boomeramg_max_iter": 1,
+        "schur_upper_velocity_boomeramg_tol": 0.0,
+
+        "pressure_solver": "hypre",
+        "pressure_ksp_type": "gmres",
+        "pressure_ksp_rtol": 1.0e-2,
+        "pressure_ksp_atol": 0.0,
+        "pressure_ksp_dtol": 1.0e8,
+        "pressure_ksp_max_it": 30,
+        "pressure_ksp_restart": 30,
+        "pressure_boomeramg_max_iter": 1,
+        "pressure_boomeramg_tol": 0.0,
+        "monitor": False,
+        # FGMRES monitors the true residual of the scaled L A R system.
+        # Because the production acceptance criterion is defined on the
+        # original unscaled equations, automatically continue with a tighter
+        # KSP tolerance if the physical residual is still above 1e-5.
+        "norm_type": "unpreconditioned",
+        "physical_residual_retry": True,
+        "max_physical_residual_retries": 3,
+        "retry_safety": 0.5,
+        "minimum_rtol": 1.0e-12,
+    },
+
     "direct_solver": {
         "solver_type": "mumps",
         "reuse_ordering": True,
@@ -81,9 +141,9 @@ RUN_SETTINGS = {
     },
 
     "profiling": {
-        "enabled": False,
+        "enabled": True,
         "print_per_iteration": True,
-        "save_timing_csv": False,
+        "save_timing_csv": True,
         "print_summary": True,
     },
 }
@@ -378,6 +438,7 @@ def _resolve_case_path(project_root: Path):
 
 def _build_internal_settings(nx: int, ny: int):
     direct = RUN_SETTINGS["direct_solver"]
+    iterative = RUN_SETTINGS["iterative_solver"]
     profiling = RUN_SETTINGS["profiling"]
     p_ref_i = int(
         round(float(RUN_SETTINGS["p_ref_i_fraction"]) * (nx - 1))
@@ -427,6 +488,7 @@ def _build_internal_settings(nx: int, ny: int):
             "j": p_ref_j,
         },
         "linear_solver": {
+            "linear_solver_type": str(RUN_SETTINGS["linear_solver_type"]),
             "solver_type": str(direct["solver_type"]),
             "reuse_ordering": bool(direct["reuse_ordering"]),
             "reuse_fill": bool(direct["reuse_fill"]),
@@ -438,6 +500,69 @@ def _build_internal_settings(nx: int, ny: int):
             "use_options_database": True,
             "verbose": True,
             "profiling": dict(profiling),
+            "iterative": {
+                "options_prefix": "flowv5_iter_",
+                "ksp_type": str(iterative["ksp_type"]),
+                "rtol": float(iterative["rtol"]),
+                "atol": float(iterative["atol"]),
+                "dtol": float(iterative["dtol"]),
+                "max_it": int(iterative["max_it"]),
+                "restart": int(iterative["restart"]),
+                "schur_fact_type": str(iterative["schur_fact_type"]),
+                "schur_pre_type": str(iterative["schur_pre_type"]),
+                "velocity_solver": str(iterative["velocity_solver"]),
+                "velocity_ksp_type": str(iterative["velocity_ksp_type"]),
+                "velocity_ksp_rtol": float(iterative["velocity_ksp_rtol"]),
+                "velocity_ksp_atol": float(iterative["velocity_ksp_atol"]),
+                "velocity_ksp_dtol": float(iterative["velocity_ksp_dtol"]),
+                "velocity_ksp_max_it": int(iterative["velocity_ksp_max_it"]),
+                "velocity_ksp_restart": int(iterative["velocity_ksp_restart"]),
+                "velocity_boomeramg_max_iter": int(iterative["velocity_boomeramg_max_iter"]),
+                "velocity_boomeramg_tol": float(iterative["velocity_boomeramg_tol"]),
+                "schur_inner_velocity_ksp_type": str(
+                    iterative["schur_inner_velocity_ksp_type"]
+                ),
+                "schur_inner_velocity_solver": str(
+                    iterative["schur_inner_velocity_solver"]
+                ),
+                "schur_inner_velocity_boomeramg_max_iter": int(
+                    iterative["schur_inner_velocity_boomeramg_max_iter"]
+                ),
+                "schur_inner_velocity_boomeramg_tol": float(
+                    iterative["schur_inner_velocity_boomeramg_tol"]
+                ),
+                "schur_upper_velocity_ksp_type": str(
+                    iterative["schur_upper_velocity_ksp_type"]
+                ),
+                "schur_upper_velocity_solver": str(
+                    iterative["schur_upper_velocity_solver"]
+                ),
+                "schur_upper_velocity_boomeramg_max_iter": int(
+                    iterative["schur_upper_velocity_boomeramg_max_iter"]
+                ),
+                "schur_upper_velocity_boomeramg_tol": float(
+                    iterative["schur_upper_velocity_boomeramg_tol"]
+                ),
+                "pressure_solver": str(iterative["pressure_solver"]),
+                "pressure_ksp_type": str(iterative["pressure_ksp_type"]),
+                "pressure_ksp_rtol": float(iterative["pressure_ksp_rtol"]),
+                "pressure_ksp_atol": float(iterative["pressure_ksp_atol"]),
+                "pressure_ksp_dtol": float(iterative["pressure_ksp_dtol"]),
+                "pressure_ksp_max_it": int(iterative["pressure_ksp_max_it"]),
+                "pressure_ksp_restart": int(iterative["pressure_ksp_restart"]),
+                "pressure_boomeramg_max_iter": int(
+                    iterative["pressure_boomeramg_max_iter"]
+                ),
+                "pressure_boomeramg_tol": float(
+                    iterative["pressure_boomeramg_tol"]
+                ),
+                "monitor": bool(iterative["monitor"]),
+                "norm_type": str(iterative["norm_type"]),
+                "physical_residual_retry": bool(iterative["physical_residual_retry"]),
+                "max_physical_residual_retries": int(iterative["max_physical_residual_retries"]),
+                "retry_safety": float(iterative["retry_safety"]),
+                "minimum_rtol": float(iterative["minimum_rtol"]),
+            },
             "flow_coupled": {
                 "options_prefix": "flowv5_",
                 "preallocation_nnz": int(
@@ -966,6 +1091,7 @@ def main() -> None:
                     "physical_cores": physical_cores,
                     "logical_cpus": logical_cpus,
                     "smt_used": bool(using_smt),
+                    "linear_solver": str(RUN_SETTINGS["linear_solver_type"]),
                     "direct_solver": str(RUN_SETTINGS["direct_solver"]["solver_type"]),
                     "use_numba": bool(RUN_SETTINGS.get("performance", {}).get("use_numba", True)),
                     "decomposition": "structured_y_slab_halo2",

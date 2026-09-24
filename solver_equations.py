@@ -39,7 +39,7 @@ def solve_pressure_velocity(
             "Transient pressure-velocity terms are reserved for the transient solver."
         )
     if linear_solver is None:
-        raise ValueError("A PetscDirectSolver instance is required for the flow solve.")
+        raise ValueError("A configured linear solver backend is required for the flow solve.")
 
     timing_enabled = bool(settings.get("profiling", {}).get("enabled", False))
     total_start = time.perf_counter()
@@ -66,7 +66,7 @@ def solve_pressure_velocity(
     timing["flow_linear_solve"] = time.perf_counter() - linear_start
 
     if not np.all(np.isfinite(scaled_local_correction)):
-        raise RuntimeError("The direct linear solver returned non-finite corrections.")
+        raise RuntimeError("The linear solver backend returned non-finite corrections.")
     correction = system.recover_correction(scaled_local_correction)
 
     backend_info = linear_solver.last_info
@@ -151,9 +151,13 @@ def solve_pressure_velocity(
         "continuity_equation": system.scaling.continuity_equation_scale,
     }
 
-    backend_timing = backend_extra.get("timing", {})
+    backend_timing = dict(backend_extra.get("timing", {}) or {})
+    if "krylov_iterations" in backend_extra:
+        backend_timing["krylov_iterations"] = float(backend_extra["krylov_iterations"])
+    if "ksp_residual" in backend_extra:
+        backend_timing["ksp_residual"] = float(backend_extra["ksp_residual"])
     if backend_timing:
-        timing["backend"] = dict(backend_timing)
+        timing["backend"] = backend_timing
     local_stats = backend_extra.get("local_assembly_stats", {})
     if isinstance(local_stats, dict):
         for key in ("coo_value_fill", "coo_matrix_update", "coo_rhs_update"):
@@ -360,7 +364,7 @@ def solve_energy(ctx, settings, fields, fluxes, transient=None, linear_solver=No
     if transient is not None:
         raise NotImplementedError("Transient energy term is reserved for the transient solver.")
     if linear_solver is None:
-        raise ValueError("A PetscDirectSolver instance is required for the energy solve.")
+        raise ValueError("A configured linear solver backend is required for the energy solve.")
 
     timing_enabled = bool(settings.get("profiling", {}).get("enabled", False))
     timing: Dict[str, Any] = {}
