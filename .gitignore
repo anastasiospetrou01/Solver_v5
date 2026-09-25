@@ -10,6 +10,8 @@ __pycache__/
 .vscode/
 
 # Solver outputs
+case_files/
+
 results/
 *.vtk
 *.vtu
