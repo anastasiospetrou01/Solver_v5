@@ -11,7 +11,7 @@ __pycache__/
 
 # Solver outputs
 case_files/
-
+0notes/
 results/
 *.vtk
 *.vtu
