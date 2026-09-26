@@ -1108,7 +1108,7 @@ def fill_flow_local_coo_kernel(
 
         rhs_abs += (
             -dpe_interp + dpw_interp - dpn_interp + dps_interp
-            + byn_corr - bys_corr
+            - byn_corr + bys_corr
         )
 
         ax_old = 0.0
@@ -1971,7 +1971,7 @@ def fill_flow_local_coo_distributed_kernel(
 
         rhs_abs += (
             -dpe_interp + dpw_interp - dpn_interp + dps_interp
-            + byn_corr - bys_corr
+            - byn_corr + bys_corr
         )
 
         ax_old = 0.0
