@@ -21,7 +21,7 @@ RUN_SETTINGS = {
     # above physical cores -> SMT/logical processors are used automatically
     "processors": 8,
 
-    "max_iter": 10,
+    "max_iter": 200,
     "tol_mass": 1.0e-6,
     "tol_T": 1.0e-6,
 
@@ -54,7 +54,7 @@ RUN_SETTINGS = {
 
     # Coupled-flow linear backend. Keep "mumps" as the production/reference
     # baseline; use "iterative" for the Stage-1 FGMRES/Schur research path.
-    "linear_solver_type": "iterative",
+    "linear_solver_type": "mumps",
 
     "iterative_solver": {
         "ksp_type": "fgmres",
